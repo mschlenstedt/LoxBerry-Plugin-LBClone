@@ -50,12 +50,31 @@ zwei Dateien:
 | Datei | Inhalt |
 |---|---|
 | `lbclone` | dieses Skript, damit das Archiv alles für die Wiederherstellung enthält |
-| `loxberry.tar` | der eigentliche Clone (verschlüsselt: `loxberry.tar.gpg`) |
+| `loxberry.tar` | der eigentliche Clone |
 
 Die Dienste der Box laufen während der Sicherung weiter. Mosquitto schreibt seine
 Datenbank vorher auf die Platte, MariaDB wird per Dump gesichert.
 
 Das Zielverzeichnis darf nicht unter `/tmp` liegen (tmpfs, beim Neustart leer).
+
+### Verschlüsseln
+
+Ein Clone enthält Zugangsdaten, Passwort-Hashes und Schlüssel. Sobald er den LoxBerry
+verlässt, sollte er verschlüsselt sein. Dafür nutzt lbclone die AES256-Verschlüsselung
+von 7-Zip und verschlüsselt das **ganze Archiv**:
+
+```sh
+bash lbclone create --output /media/usb/clones --encrypt              # fragt das Passwort ab
+bash lbclone create --output /media/usb/clones --password 'geheim'    # Passwort direkt
+```
+
+- Nur mit den Formaten `7z` (Standard) und `zip`, nicht mit `gz`.
+- Bei `7z` sind auch die Dateinamen im Archiv verschlüsselt.
+- Beim Entpacken fragt 7-Zip nach dem Passwort – auf dem LoxBerry mit `7z x` ebenso wie
+  unter Windows. Danach liegen `lbclone` und `loxberry.tar` unverschlüsselt vor, und
+  `bash lbclone apply` braucht kein Passwort mehr.
+- Ein mit `--password` übergebenes Passwort steht in der Shell-History und ist während
+  des Laufs in der Prozessliste sichtbar. `--encrypt` fragt es stattdessen verdeckt ab.
 
 ### Optionen für `create`
 
@@ -63,7 +82,8 @@ Das Zielverzeichnis darf nicht unter `/tmp` liegen (tmpfs, beim Neustart leer).
 |---|---|
 | `--output <verzeichnis>` | Zielverzeichnis für das Archiv. Pflicht. |
 | `--compress 7z\|zip\|gz` | Archivformat, Standard `7z`. `7z` und `zip` erzeugt 7-Zip, `gz` ein `.tar.gz`. Alle drei lassen sich auch unter Windows entpacken. |
-| `--encrypt --passphrase-file <datei>` | Verschlüsselt `loxberry.tar` symmetrisch mit gpg (AES256). Das Skript im Archiv bleibt lesbar. |
+| `--password <passwort>` | Verschlüsselt das ganze Archiv mit 7-Zip (AES256). Nur mit `7z` und `zip`. |
+| `--encrypt` | Wie `--password`, fragt das Passwort aber verdeckt am Terminal ab. |
 | `--exclude-plugin-data <folder>:<pfad>` | Lässt einen Pfad unter `data/plugins/<folder>/` weg, z. B. große Aufzeichnungen. Mehrfach verwendbar. |
 | `--no-logs` | Lässt die Logs weg. |
 | `--stop-service <name>` | Hält diesen Dienst für die Dauer der Sicherung an. Mehrfach verwendbar. |
@@ -87,8 +107,9 @@ Das Zielverzeichnis darf nicht unter `/tmp` liegen (tmpfs, beim Neustart leer).
    bash lbclone apply
    ```
 
-   Ohne `--input` nimmt lbclone das `loxberry.tar` bzw. `loxberry.tar.gpg`, das
-   neben ihm liegt. Mit `--input` geht auch das ganze Archiv direkt.
+   Ohne `--input` nimmt lbclone das `loxberry.tar`, das neben ihm liegt. Mit `--input`
+   geht auch das ganze Archiv direkt; ist es verschlüsselt, fragt lbclone nach dem
+   Passwort (oder `--password`).
 
 Zuerst prüft lbclone, ob Ziel und Clone zusammenpassen (Debian-Version,
 DietPi, kein LoxBerry installiert, freier Platz, Installer und Release
@@ -132,8 +153,8 @@ alle Warnungen.
 
 | Option | Wirkung |
 |---|---|
-| `--input <clone>` | Das ganze Archiv (`.7z`, `.zip`, `.tar.gz`) oder das entpackte `loxberry.tar[.gpg]`. |
-| `--passphrase-file <datei>` | Passphrase für einen verschlüsselten Clone. Sie wird nirgends gespeichert. |
+| `--input <clone>` | Das ganze Archiv (`.7z`, `.zip`, `.tar.gz`) oder das entpackte `loxberry.tar`. |
+| `--password <passwort>` | Passwort für ein verschlüsseltes Archiv, das mit `--input` direkt übergeben wird. Ohne Angabe fragt lbclone nach. Es wird nirgends gespeichert. |
 | `--hostname <name>` | Neuer Hostname. Macht den Clone zur zweiten Box: die SSH-Host-Keys werden neu erzeugt. Achtung: der Hostname ist Präfix der Topics des MQTT-Gateways. |
 | `--lbname <name>` | Neuer LoxBerry-Name, unabhängig vom Hostnamen. |
 | `--update-core` | Nach dem Einspielen und vor der Plugin-Neuinstallation LoxBerry auf das neueste Release aktualisieren (für ältere Clones). |

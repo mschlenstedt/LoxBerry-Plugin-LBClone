@@ -409,11 +409,13 @@ meta_check_sums() {
 # Clone-Archiv (7z Standard, zip, tar.gz). Aufbau – unter Windows wie Linux entpackbar:
 #
 #   lbclone          dieses Skript (eine Datei)
-#   loxberry.tar     der eigentliche Clone (bei Verschlüsselung loxberry.tar.gpg)
+#   loxberry.tar     der eigentliche Clone
 #
+# Mit Passwort verschlüsselt 7-Zip das ganze Archiv (AES256; bei 7z auch die Dateinamen).
 # loxberry.tar bleibt beim Entpacken ein tar: nur tar bewahrt Eigentümer und Rechte.
 # Sein erstes Member ist meta.tar (Manifest), danach die Payload relativ zu /.
-# Lesen geht aus dem ganzen Archiv oder direkt aus einem entpackten loxberry.tar[.gpg].
+# Lesen geht aus dem ganzen Archiv oder direkt aus einem entpackten loxberry.tar.
+# Passwort-Argument der archive_*-Funktionen: "-" oder leer = unverschlüsselt.
 
 LBB_INNER=loxberry.tar
 
@@ -435,38 +437,77 @@ archive_tools() {
 	esac
 }
 
-# Name des inneren Clones in einem äußeren Archiv (…/loxberry.tar oder …/loxberry.tar.gpg)
+# Passwort-Option für 7z (leer, wenn unverschlüsselt): _arch_pw <passwort|->
+_arch_pw() {
+	if [ -n "${1:-}" ] && [ "$1" != "-" ]; then
+		printf '%s' "-p$1"
+	fi
+}
+
+# Name des inneren Clones in einem äußeren Archiv: _arch_member <datei> [passwort|-]
 _arch_member() {
+	local pw
+	pw="$(_arch_pw "${2:-}")"
 	case "$1" in
 		*.7z|*.zip)
-			7z l -ba "$1" 2>/dev/null | awk '{print $NF}' | grep -m1 -E "(^|/)$LBB_INNER(\.gpg)?$"
+			7z l -ba ${pw:+"$pw"} "$1" 2>/dev/null | awk '{print $NF}' | grep -m1 -E "(^|/)$LBB_INNER$"
 			;;
 		*.tar.gz)
-			gzip -dc "$1" 2>/dev/null | tar -tf - 2>/dev/null | grep -m1 -E "(^|/)$LBB_INNER(\.gpg)?$"
+			gzip -dc "$1" 2>/dev/null | tar -tf - 2>/dev/null | grep -m1 -E "(^|/)$LBB_INNER$"
 			;;
 		*) basename "$1" ;;
 	esac
 }
 
+# Verschlüsselt? 7z mit verschlüsselten Dateinamen lässt sich ohne Passwort nicht auflisten,
+# zip zeigt "Encrypted = +". Das Scheinpasswort verhindert eine Rückfrage von 7z.
 archive_is_encrypted() {
-	case "$(_arch_member "$1")" in *.gpg) return 0 ;; esac
+	case "$1" in
+		*.7z|*.zip)
+			7z l -ba -slt -pX "$1" > /dev/null 2>&1 || return 0
+			7z l -slt -pX "$1" 2>/dev/null | grep -q '^Encrypted = +' && return 0
+			;;
+	esac
 	return 1
 }
 
-# Ohne Passphrase-Datei würde gpg auf eine Eingabe warten, die nie kommt
+# Passwort abfragen (nur am Terminal): lbb_ask_password <text> [bestätigen]
+lbb_ask_password() {
+	local a b
+	[ -t 0 ] || return 1
+	read -r -s -p "$1: " a
+	printf '\n' >&2
+	if [ "${2:-}" = bestätigen ]; then
+		read -r -s -p "Passwort wiederholen: " b
+		printf '\n' >&2
+		[ "$a" = "$b" ] || die 2 "Die Passwörter stimmen nicht überein."
+	fi
+	[ -n "$a" ] || die 2 "Leeres Passwort."
+	LBB_PASSWORD="$a"
+}
+
+# Verschlüsselter Clone ohne --password: am Terminal nachfragen, sonst Abbruch
 archive_require_pass() {
 	if archive_is_encrypted "$1" && { [ -z "${2:-}" ] || [ "$2" = "-" ]; }; then
-		die 2 "Der Clone ist verschlüsselt: --passphrase-file angeben."
+		lbb_ask_password "Passwort für $1" ||
+			die 2 "Der Clone ist verschlüsselt: --password angeben."
 	fi
 }
 
-# archive_create <ausgabe> <arbeitsordner> <7z|zip|gz> <passfile|-> <exclude-datei> <payload-liste> [zwischenablage]
+# archive_create <ausgabe> <arbeitsordner> <7z|zip|gz> <passwort|-> <exclude-datei> <payload-liste> [zwischenablage]
 # Status 0 ok, 1 Warnung von tar, 3 Fehler (dann ist <ausgabe> gelöscht).
 archive_create() {
-	local out="$1" work="$2" comp="$3" pass="$4" excl="$5" list="$6" stage="${7:-}" line rc inner
-	local -a snap=() dumps=() verbose=()
+	local out="$1" work="$2" comp="$3" pass="$4" excl="$5" list="$6" stage="${7:-}" line rc inner pw
+	local -a snap=() dumps=() verbose=() enc=()
 	inner="$LBB_INNER"
-	[ "$pass" != "-" ] && inner="$inner.gpg"
+	pw="$(_arch_pw "$pass")"
+	if [ -n "$pw" ]; then
+		case "$comp" in
+			7z) enc=("$pw" -mhe=on) ;;
+			zip) enc=("$pw" -mem=AES256) ;;
+			*) log_err "Verschlüsselung nur mit 7z oder zip."; return 3 ;;
+		esac
+	fi
 	# Momentaufnahmen: nur die in snap.list genannten Pfade, ohne ihre Elternverzeichnisse
 	if [ -s "$work/snap.list" ]; then
 		snap=(-C "$work/snap" --files-from="$work/snap.list")
@@ -494,29 +535,22 @@ archive_create() {
 				2> "$work/tar-warnings.txt"
 			echo "$?" > "$work/tar-status"
 		}
-		_arch_encrypt() {
-			if [ "$pass" != "-" ]; then
-				gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$pass" --symmetric --cipher-algo AES256 -o -
-			else
-				cat
-			fi
-		}
 		case "$comp" in
 			gz)
 				# tar.gz braucht die Größe von loxberry.tar vorab: Zwischendatei auf dem Zielmedium
 				tmp="$(mktemp -d "$(dirname "$out")/.lbclone-gz.XXXXXX")" || exit 3
 				trap 'rm -rf "$tmp"' EXIT
 				cp -p "$work/pkg/lbclone" "$tmp/"
-				_arch_inner_stream | _arch_encrypt > "$tmp/$inner" || exit 3
+				_arch_inner_stream > "$tmp/$inner" || exit 3
 				tar -C "$tmp" -cf - lbclone "$inner" | gzip -c > "$out" || exit 3
 				;;
 			*)
 				t=7z
 				[ "$comp" = zip ] && t=zip
-				( cd "$work/pkg" && 7z a -t"$t" -bd -bso0 -bsp0 "$out" lbclone ) || exit 3
-				_arch_inner_stream | _arch_encrypt | 7z a -t"$t" -bd -bso0 -bsp0 -si"$inner" "$out"
+				( cd "$work/pkg" && 7z a -t"$t" -bd -bso0 -bsp0 "${enc[@]}" "$out" lbclone ) || exit 3
+				_arch_inner_stream | 7z a -t"$t" -bd -bso0 -bsp0 "${enc[@]}" -si"$inner" "$out"
 				st=("${PIPESTATUS[@]}")
-				[ "${st[1]}" = 0 ] && [ "${st[2]}" = 0 ] || exit 3
+				[ "${st[1]}" = 0 ] || exit 3
 				;;
 		esac
 		case "$(cat "$work/tar-status" 2>/dev/null)" in
@@ -535,34 +569,28 @@ archive_create() {
 	return "$rc"
 }
 
-# Inneres loxberry.tar als tar-Strom auf stdout: archive_stream <datei> <passfile|->
-# <datei> ist das ganze Archiv (7z, zip, tar.gz) oder ein entpacktes loxberry.tar[.gpg].
+# Inneres loxberry.tar als tar-Strom auf stdout: archive_stream <datei> <passwort|->
+# <datei> ist das ganze Archiv (7z, zip, tar.gz) oder ein entpacktes loxberry.tar.
 archive_stream() {
-	local f="$1" pass="${2:--}" member
-	member="$(_arch_member "$f")"
-	[ -n "$member" ] || { log_err "Kein $LBB_INNER in $f gefunden."; return 2; }
-	(
-		set -o pipefail
-		case "$f" in
-			*.7z|*.zip) 7z x -so -bd "$f" "$member" 2>/dev/null ;;
-			*.tar.gz) gzip -dc "$f" | tar -xOf - "$member" ;;
-			*) cat "$f" ;;
-		esac | if [ "${member%.gpg}" != "$member" ]; then
-			gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$pass" -d
-		else
-			cat
-		fi
-	)
+	local f="$1" pw member
+	pw="$(_arch_pw "${2:-}")"
+	member="$(_arch_member "$f" "${2:-}")"
+	[ -n "$member" ] || { log_err "Kein $LBB_INNER in $f gefunden (Passwort?)."; return 2; }
+	case "$f" in
+		*.7z|*.zip) 7z x -so -bd ${pw:+"$pw"} "$f" "$member" 2>/dev/null ;;
+		*.tar.gz) ( set -o pipefail; gzip -dc "$f" | tar -xOf - "$member" ) ;;
+		*) cat "$f" ;;
+	esac
 }
 
-# archive_read_meta <datei> <passfile|-> <ziel> – liest nur das erste Member (meta.tar)
+# archive_read_meta <datei> <passwort|-> <ziel> – liest nur das erste Member (meta.tar)
 archive_read_meta() {
 	mkdir -p "$3"
 	archive_stream "$1" "$2" 2>/dev/null | tar -x -O --occurrence=1 -f - meta.tar 2>/dev/null | tar -x -C "$3" -f -
 	[ -r "$3/meta/meta.json" ]
 }
 
-# archive_extract <datei> <passfile|-> <ziel> [tar-optionen/member…]
+# archive_extract <datei> <passwort|-> <ziel> [tar-optionen/member…]
 archive_extract() {
 	local a="$1" p="$2" dest="$3"
 	shift 3
@@ -579,12 +607,13 @@ archive_extract() {
 	return "${st[1]}"
 }
 
-# archive_verify <datei> <passfile|-> <arbeitsordner>
+# archive_verify <datei> <passwort|-> <arbeitsordner>
 archive_verify() {
-	local a="$1" p="$2" work="$3"
-	# Das ganze Archiv, auch der Werkzeug-Teil – ein kaputtes lbclone/ nützt beim Restore nichts
+	local a="$1" p="$2" work="$3" pw
+	pw="$(_arch_pw "$p")"
+	# Das ganze Archiv, auch der Werkzeug-Teil – ein kaputtes lbclone nützt beim Restore nichts
 	case "$a" in
-		*.7z|*.zip) 7z t -bd -bso0 -bsp0 "$a" > /dev/null 2>&1 || return 1 ;;
+		*.7z|*.zip) 7z t -bd -bso0 -bsp0 ${pw:+"$pw"} "$a" > /dev/null 2>&1 || return 1 ;;
 		*.tar.gz) gzip -t "$a" 2>/dev/null || return 1 ;;
 	esac
 	archive_stream "$a" "$p" | tar -t -f - > /dev/null
@@ -958,16 +987,15 @@ create_main() {
 	esac
 	[ -d "$LBB_OUTPUT" ] && [ -w "$LBB_OUTPUT" ] || die 2 "Ausgabeverzeichnis nicht beschreibbar: $LBB_OUTPUT"
 
-	# jq, 7-Zip und ggf. gpg bei Bedarf nachinstallieren
+	# jq und 7-Zip bei Bedarf nachinstallieren
 	case "$LBB_COMPRESS" in
 		7z|zip|gz) ;;
 		*) die 2 "--compress: '$LBB_COMPRESS' – erlaubt sind 7z, zip und gz." ;;
 	esac
-	local -a tools=(jq:jq "$(archive_tools "$LBB_COMPRESS")")
-	if [ "$LBB_PASSFILE" != "-" ]; then
-		tools+=(gpg:gpg)
+	if [ -n "$LBB_PASSWORD" ] && [ "$LBB_PASSWORD" != "-" ] && [ "$LBB_COMPRESS" = gz ]; then
+		die 2 "Verschlüsselung gibt es nur mit --compress 7z oder zip (7-Zip, AES256)."
 	fi
-	lbb_ensure_tools "${tools[@]}"
+	lbb_ensure_tools jq:jq "$(archive_tools "$LBB_COMPRESS")"
 
 	meta_collect_system "$lbhome"
 	meta_check_v0 || die 2 "Nicht unterstützt: Debian $META_OS_VERSION_ID / LoxBerry $META_LB_VERSION (mindestens Debian 13 und LoxBerry 4)."
@@ -1018,7 +1046,7 @@ create_main() {
 	out="$LBB_OUTPUT/lbclone-${META_HOSTNAME}-${META_LB_VERSION}-$(date +%Y%m%d-%H%M%S).$ext"
 	log_info "Schreibe $out"
 	_LBB_OUT="$out"
-	archive_create "$out" "$work" "$LBB_COMPRESS" "$LBB_PASSFILE" "$work/exclude.list" "$work/payload.list" "$_LBB_STAGE"
+	archive_create "$out" "$work" "$LBB_COMPRESS" "$LBB_PASSWORD" "$work/exclude.list" "$work/payload.list" "$_LBB_STAGE"
 	rc=$?
 	_create_restart_services
 	rm -rf "$_LBB_STAGE"
@@ -1033,14 +1061,14 @@ create_main() {
 		head -n 20 "$work/tar-warnings.txt" | while IFS= read -r s; do log_warn "  $s"; done
 	fi
 	chmod 600 "$out"
-	archive_verify "$out" "$LBB_PASSFILE" "$work/verify" || die 3 "Prüfung des Archivs fehlgeschlagen: $out"
+	archive_verify "$out" "$LBB_PASSWORD" "$work/verify" || die 3 "Prüfung des Archivs fehlgeschlagen: $out"
 	_LBB_OUT=""
 	log_ok "Backup fertig: $out ($(du -h "$out" | cut -f1))"
 	log_info "Einspielen auf einem frischen DietPi: Archiv entpacken (7z x …, auch unter Windows möglich), im entpackten Ordner als root: bash lbclone apply"
 	case "$LBB_OUTPUT" in
 		/mnt/*|/media/*)
-			if [ "$LBB_PASSFILE" = "-" ]; then
-				log_warn "Backup liegt auf einem Netz- oder Wechsellaufwerk und ist unverschlüsselt; es enthält Zugangsdaten. Empfehlung: --encrypt."
+			if [ -z "$LBB_PASSWORD" ] || [ "$LBB_PASSWORD" = "-" ]; then
+				log_warn "Backup liegt auf einem Netz- oder Wechsellaufwerk und ist unverschlüsselt; es enthält Zugangsdaten. Empfehlung: --password."
 			fi
 			;;
 	esac
@@ -1049,10 +1077,7 @@ create_main() {
 # Gemeinsame Vorbereitung für info und verify: Werkzeuge und Arbeitsordner (setzt _LBB_WORK)
 _readonly_prepare() {
 	lbb_ensure_tools jq:jq "$(archive_tools "$LBB_INPUT")"
-	if archive_is_encrypted "$LBB_INPUT"; then
-		archive_require_pass "$LBB_INPUT" "$LBB_PASSFILE"
-		lbb_ensure_tools gpg:gpg
-	fi
+	archive_require_pass "$LBB_INPUT" "$LBB_PASSWORD"
 	_LBB_WORK="$(mktemp -d "/tmp/lbclone-$1.XXXXXX")"
 	trap 'rm -rf "$_LBB_WORK"' EXIT
 }
@@ -1060,7 +1085,7 @@ _readonly_prepare() {
 info_main() {
 	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
 	_readonly_prepare info
-	archive_read_meta "$LBB_INPUT" "$LBB_PASSFILE" "$_LBB_WORK" || die 3 "Manifest nicht lesbar."
+	archive_read_meta "$LBB_INPUT" "$LBB_PASSWORD" "$_LBB_WORK" || die 3 "Manifest nicht lesbar (Passwort falsch?)."
 	meta_read_json "$_LBB_WORK/meta/meta.json"
 	printf 'Box:         %s\n' "$META_HOSTNAME"
 	printf 'System:      %s %s (%s), %s\n' "$META_OS_ID" "$META_OS_VERSION_ID" "$META_OS_CODENAME" "$META_ARCH"
@@ -1074,7 +1099,7 @@ info_main() {
 verify_main() {
 	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
 	_readonly_prepare verify
-	archive_verify "$LBB_INPUT" "$LBB_PASSFILE" "$_LBB_WORK" || die 3 "Archiv beschädigt oder Prüfsummen falsch: $LBB_INPUT"
+	archive_verify "$LBB_INPUT" "$LBB_PASSWORD" "$_LBB_WORK" || die 3 "Archiv beschädigt oder Prüfsummen falsch: $LBB_INPUT"
 	log_ok "Archiv in Ordnung: $LBB_INPUT"
 }
 
@@ -1104,18 +1129,15 @@ apply_precheck() {
 	case "$path" in
 		/opt/*|/tmp/*) die 2 "lbclone liegt unter $path – der Installer löscht LBHOMEDIR, der Neustart leert /tmp. Den Clone z. B. nach /root entpacken." ;;
 	esac
-	# jq für das Manifest, 7-Zip bzw. gzip für das Archiv, gpg bei Verschlüsselung
+	# jq für das Manifest, 7-Zip bzw. gzip für das Archiv
 	lbb_ensure_tools jq:jq "$(archive_tools "$LBB_INPUT")"
-	if archive_is_encrypted "$LBB_INPUT"; then
-		archive_require_pass "$LBB_INPUT" "$LBB_PASSFILE"
-		lbb_ensure_tools gpg:gpg
-	fi
+	archive_require_pass "$LBB_INPUT" "$LBB_PASSWORD"
 	st="$(_apply_state)"
 	rm -rf "$st/meta"
 	mkdir -p "$st"
 	chmod 700 "$st"
 	log_debug "Clone: $LBB_INPUT"
-	archive_read_meta "$LBB_INPUT" "$LBB_PASSFILE" "$st" || die 2 "Manifest nicht lesbar (Passphrase?)."
+	archive_read_meta "$LBB_INPUT" "$LBB_PASSWORD" "$st" || die 2 "Manifest nicht lesbar – Passwort falsch oder Archiv beschädigt."
 	meta_check_sums "$st" || die 2 "Prüfsummen des Manifests stimmen nicht."
 	meta_read_json "$st/meta/meta.json"
 	log_debug "Manifest: $META_HOSTNAME, $META_OS_ID $META_OS_VERSION_ID ($META_OS_CODENAME), $META_ARCH, LoxBerry $META_LB_VERSION"
@@ -1162,7 +1184,7 @@ apply_precheck() {
 
 
 	# Clone einmal unverschlüsselt ins Zustandsverzeichnis (Platte): danach braucht der Restore
-	# weder 7-Zip noch die Passphrase, und es ist egal, wo das Archiv lag
+	# weder 7-Zip noch das Passwort, und es ist egal, wo das Archiv lag
 	if [ "${LBB_DRY_RUN:-0}" != 1 ]; then
 		case "$(readlink -m "$LBB_INPUT")" in
 			/opt/*|/tmp/*) path=volatil ;;
@@ -1170,9 +1192,9 @@ apply_precheck() {
 		esac
 		if archive_is_encrypted "$LBB_INPUT" || [ "$(archive_tools "$LBB_INPUT")" != tar:tar ] || [ "$path" = volatil ]; then
 			log_info "Lege $LBB_INNER nach $st"
-			( umask 077; archive_stream "$LBB_INPUT" "$LBB_PASSFILE" > "$st/$LBB_INNER" ) || die 2 "Clone ließ sich nicht auspacken (Passphrase?)."
+			( umask 077; archive_stream "$LBB_INPUT" "$LBB_PASSWORD" > "$st/$LBB_INNER" ) || die 2 "Clone ließ sich nicht auspacken (Passwort?)."
 			LBB_INPUT="$st/$LBB_INNER"
-			LBB_PASSFILE="-"
+			LBB_PASSWORD="-"
 		fi
 	fi
 
@@ -2110,18 +2132,20 @@ LBB_PERL
 usage() {
 	cat <<'EOF'
 lbclone create --output <verzeichnis> [--exclude-plugin-data <folder>:<pfad>] [--no-logs]
-                     [--stop-service <name>] [--compress 7z|zip|gz] [--encrypt --passphrase-file <datei>]
+                     [--stop-service <name>] [--compress 7z|zip|gz] [--password <passwort> | --encrypt]
                      [--config <datei>] [--dry-run]
-lbclone apply [--input <clone>] [--passphrase-file <datei>] [--force-plugin-reinstall]
+lbclone apply [--input <clone>] [--password <passwort>] [--force-plugin-reinstall]
                      [--no-plugin-reinstall] [--skip-plugin <folder>] [--skip-install]
                      [--allow-core-mismatch] [--github-auth <user:token>] [--no-reboot]
                      [--hostname <name>] [--lbname <LoxBerry-Name>] [--update-core] [--dry-run]
 lbclone apply --resume
-lbclone info    [--input <clone>] [--passphrase-file <datei>]
-lbclone verify  [--input <clone>] [--passphrase-file <datei>]
+lbclone info    [--input <clone>] [--password <passwort>]
+lbclone verify  [--input <clone>] [--password <passwort>]
 
-<clone> ist das ganze Archiv (.7z, .zip, .tar.gz) oder das entpackte loxberry.tar[.gpg].
-Ohne --input nimmt lbclone das loxberry.tar[.gpg], das neben ihm liegt.
+<clone> ist das ganze Archiv (.7z, .zip, .tar.gz) oder das entpackte loxberry.tar.
+Ohne --input nimmt lbclone das loxberry.tar, das neben ihm liegt.
+--password verschlüsselt mit 7-Zip (AES256) das ganze Archiv (nur 7z und zip); --encrypt
+fragt das Passwort am Terminal ab. Ein verschlüsselter Clone ohne --password: Rückfrage.
 
 lbclone config-example   Vorlage für $LBHOMEDIR/config/system/lbclone.cfg ausgeben
 
@@ -2158,14 +2182,16 @@ lbb_main() {
 		[ -n "$_cfg" ] && lbb_load_config "$_cfg"
 	fi
 
-	LBB_PASSFILE="-"
+	LBB_PASSWORD="-"
 	LBB_ENCRYPT=0
 	LBB_SKIP_PLUGINS=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--output) LBB_OUTPUT="$2"; shift ;;
 			--input) LBB_INPUT="$2"; shift ;;
-			--passphrase-file) LBB_PASSFILE="$2"; shift ;;
+			--password)
+				{ [ -n "${2:-}" ] && [ "$2" != "-" ]; } || die 2 "--password: leeres Passwort."
+				LBB_PASSWORD="$2"; shift ;;
 			--encrypt) LBB_ENCRYPT=1 ;;
 			--exclude-plugin-data) LBB_PLUGIN_EXCLUDES+=("$2"); shift ;;
 			--no-logs) LBB_NO_LOGS=1 ;;
@@ -2192,17 +2218,17 @@ lbb_main() {
 	done
 
 	if [ "$cmd" = create ]; then
-		if [ "$LBB_ENCRYPT" = 1 ] && [ "$LBB_PASSFILE" = "-" ]; then
-			die 2 "--encrypt braucht --passphrase-file."
+		if [ "$LBB_ENCRYPT" = 1 ] && [ "$LBB_PASSWORD" = "-" ]; then
+			lbb_ask_password "Passwort für den Clone" bestätigen ||
+				die 2 "--encrypt fragt das Passwort am Terminal ab; ohne Terminal --password angeben."
 		fi
-		[ "$LBB_ENCRYPT" = 1 ] || LBB_PASSFILE="-"
 	fi
 
 	# Ohne --input: das loxberry.tar neben dem entpackten lbclone-Ordner
 	if [ -z "${LBB_INPUT:-}" ] && [ "${LBB_RESUME:-0}" != 1 ]; then
 		case "$cmd" in
 			apply|info|verify)
-				for _f in "$(dirname "$LBB_SELF")/loxberry.tar" "$(dirname "$LBB_SELF")/loxberry.tar.gpg"; do
+				for _f in "$(dirname "$LBB_SELF")/loxberry.tar"; do
 					if [ -r "$_f" ]; then
 						LBB_INPUT="$(readlink -m "$_f")"
 						break
