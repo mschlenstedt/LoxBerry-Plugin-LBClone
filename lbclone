@@ -6,6 +6,7 @@
 #
 # Wird die Datei mit "source" geladen (Tests), definiert sie nur die Funktionen.
 
+LBB_VERSION="0.1.0"
 LBB_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # ============================================================ common
@@ -2130,6 +2131,7 @@ LBB_PERL
 # ============================================================ Kommandozeile
 
 usage() {
+	printf 'lbclone %s\n\n' "$LBB_VERSION"
 	cat <<'EOF'
 lbclone create --output <verzeichnis> [--exclude-plugin-data <folder>:<pfad>] [--no-logs]
                      [--stop-service <name>] [--compress 7z|zip|gz] [--password <passwort> | --encrypt]
@@ -2148,6 +2150,7 @@ Ohne --input nimmt lbclone das loxberry.tar, das neben ihm liegt.
 fragt das Passwort am Terminal ab. Ein verschlüsselter Clone ohne --password: Rückfrage.
 
 lbclone config-example   Vorlage für $LBHOMEDIR/config/system/lbclone.cfg ausgeben
+lbclone --version        Version ausgeben
 
 Alle Kommandos: -v|--verbose  sehr gesprächige Ausgabe (Schritte, Befehle, Dateilisten)
 EOF
@@ -2160,6 +2163,7 @@ lbb_main() {
 	# Interne bzw. einfache Kommandos ohne Optionsauswertung
 	case "$cmd" in
 		-h|--help|help) usage; exit 0 ;;
+		-V|--version) printf 'lbclone %s\n' "$LBB_VERSION"; exit 0 ;;
 		'') usage; exit 2 ;;
 		__plugins) _lbb_perl "$@"; exit $? ;;
 		config-example) _lbb_conf_example; exit 0 ;;
