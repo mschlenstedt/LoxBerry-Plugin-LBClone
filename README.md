@@ -19,9 +19,11 @@ lbclone ist eine einzige Bash-Datei. Es gibt nichts zu installieren.
 
 - Quelle und Ziel: DietPi mit **Debian 13 (trixie)** oder neuer und **LoxBerry 4**
   oder neuer.
-- Ziel: ein **frisches DietPi** mit derselben Debian-Version (Codename) und derselben
-  Architektur wie die Quelle, noch ohne LoxBerry. Eine abweichende Debian-Subversion
-  (z. B. 13.4 → 13.7) ist erlaubt und wird nur als Warnung gemeldet.
+- Ziel: ein **frisches DietPi** mit derselben Debian-Version (Codename) wie die Quelle,
+  noch ohne LoxBerry. Eine abweichende Debian-Subversion (z. B. 13.4 → 13.7) ist
+  erlaubt und wird nur als Warnung gemeldet.
+- Die Hardware darf eine andere sein, auch die Architektur – siehe
+  [Andere Hardware](#andere-hardware).
 - Beide Kommandos laufen als `root`.
 - Das Ziel braucht Internet: Installer, Pakete und Plugins werden heruntergeladen.
 - Fehlende Werkzeuge (`jq`, 7-Zip) installiert lbclone selbst per apt nach.
@@ -89,7 +91,7 @@ Das Zielverzeichnis darf nicht unter `/tmp` liegen (tmpfs, beim Neustart leer).
    neben ihm liegt. Mit `--input` geht auch das ganze Archiv direkt.
 
 Zuerst prüft lbclone, ob Ziel und Clone zusammenpassen (Debian-Version,
-Architektur, DietPi, kein LoxBerry installiert, freier Platz, Installer und Release
+DietPi, kein LoxBerry installiert, freier Platz, Installer und Release
 auf GitHub vorhanden). Passt etwas nicht, bricht es ab, bevor es irgendetwas ändert.
 
 Danach läuft der Restore selbständig durch und startet die Box am Ende einmal neu.
@@ -144,6 +146,27 @@ alle Warnungen.
 | `--no-reboot` | Am Ende nicht neu starten. |
 | `--dry-run` | Nur prüfen und den Plan zeigen, nichts ändern. |
 | `--resume` | Einen abgebrochenen Restore fortsetzen. |
+
+## Andere Hardware
+
+LoxBerry ist hardwareunabhängig. Ein Clone lässt sich deshalb auch auf andere Hardware
+einspielen, z. B. vom Raspberry Pi 4 auf einen Pi 5 oder von einer VM auf einen Mini-PC.
+
+- Was zur Hardware gehört, kommt vom Installer der neuen Box: die Hardware-Merker von
+  LoxBerry (`config/system/is_*.cfg`), Kernelmodule und udev-Regeln (`/etc/modprobe.d`,
+  `/etc/modules-load.d`, `/etc/udev/rules.d`). Hardwaregebundene Pakete wie Kernel,
+  Bootloader und Firmware werden nicht übertragen.
+- Unter `/usr/local` überschreibt lbclone nichts, was der Installer dort schon angelegt
+  hat.
+
+**Architekturwechsel** (z. B. Raspberry Pi mit `arm64` ↔ PC mit `amd64`) ist möglich,
+aber ein Risiko – lbclone warnt davor deutlich. Programme und Bibliotheken aus dem Clone
+passen dann nicht zur neuen Box. lbclone spielt sie nicht ein (beim Erstellen notiert es,
+welche Dateien das sind) und installiert stattdessen **alle** Plugins mit
+Download-Adresse neu, unabhängig von ihrer Autoupdate-Einstellung. Plugins ohne
+Download-Adresse oder ohne Unterstützung für die neue Architektur funktionieren danach
+vermutlich nicht; der Bericht nennt sie. Ein Architekturwechsel braucht einen Clone, der
+mit der aktuellen Version von lbclone erstellt wurde.
 
 ## Weitere Kommandos
 

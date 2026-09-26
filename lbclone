@@ -292,6 +292,22 @@ collect_var_lib_dirs() {
 }
 
 # Relative Pfade optionaler Bereiche, nur wenn vorhanden und nicht leer bzw. nicht nur Standard
+# Architekturgebundene Pfade der Payload (relativ zu /): ELF-Dateien und Python-Umgebungen
+# (Verzeichnis mit pyvenv.cfg) als Ganzes. Bei einem Architekturwechsel spielt apply sie nicht ein.
+collect_native() {
+	( cd "$(lbb_p /)" && tr '\n' '\0' < "$1" | xargs -0 -r perl -MFile::Find -e '
+		find({ no_chdir => 1, wanted => sub {
+			my $f = $File::Find::name;
+			if (-d $f && !-l $f && -e "$f/pyvenv.cfg") { print "$f\n"; $File::Find::prune = 1; return; }
+			return if -l $f || !-f $f;
+			open(my $h, "<", $f) or return;
+			binmode $h;
+			my $magic = "";
+			read($h, $magic, 4);
+			print "$f\n" if $magic eq "\x7fELF";
+		} }, @ARGV);' ) | sort
+}
+
 collect_optional_dirs() {
 	local d
 	for d in var/spool/cron/crontabs mnt/dietpi_userdata; do
@@ -665,6 +681,7 @@ plugins_decide() {
 	local s
 	[ "${LBB_FORCE_PLUGIN_REINSTALL:-0}" = 1 ] && args+=(--force)
 	[ "${LBB_NO_PLUGIN_REINSTALL:-0}" = 1 ] && args+=(--none)
+	[ "${LBB_ARCH_CHANGE:-0}" = 1 ] && args+=(--all)
 	for s in "${LBB_SKIP_PLUGINS[@]}"; do
 		args+=(--skip "$s")
 	done
@@ -899,6 +916,8 @@ create_build_lists() {
 			printf '%s\n' "$e"
 		fi
 	done > "$work/payload.list"
+	# Für einen Restore auf anderer Architektur (apply lässt diese Pfade dann weg)
+	collect_native "$work/payload.list" > "$work/meta/native.txt"
 
 	{
 		printf '%s\n' "$rel/log/system_tmpfs" "$rel/.cache" "$rel/.npm/_cacache" "$rel/data/system/tmp"
@@ -1110,7 +1129,13 @@ apply_precheck() {
 	if [ -n "${META_DEBIAN_VERSION:-}" ] && [ "$(cat "$(lbb_p /etc/debian_version)" 2>/dev/null)" != "$META_DEBIAN_VERSION" ]; then
 		log_warn "Debian-Subversion weicht ab (Backup $META_DEBIAN_VERSION, hier $(cat "$(lbb_p /etc/debian_version)" 2>/dev/null))."
 	fi
-	[ "$(dpkg --print-architecture)" = "$META_ARCH" ] || die 2 "Architektur passt nicht (Backup: $META_ARCH)."
+	LBB_ARCH_CHANGE=0
+	if [ "$(dpkg --print-architecture)" != "$META_ARCH" ]; then
+		[ -e "$st/meta/native.txt" ] ||
+			die 2 "Architekturwechsel ($META_ARCH → $(dpkg --print-architecture)): Dieser Clone enthält keine Liste der architekturgebundenen Dateien. Den Clone mit dem aktuellen lbclone neu erstellen."
+		LBB_ARCH_CHANGE=1
+		_apply_arch_warning "$META_ARCH" "$(dpkg --print-architecture)"
+	fi
 	[ -e "$(lbb_p /boot/dietpi/.version)" ] || die 2 "Kein DietPi gefunden."
 
 	if [ "${LBB_ALLOW_CORE_MISMATCH:-0}" = 1 ] && [ "${LBB_SKIP_INSTALL:-0}" != 1 ]; then
@@ -1260,6 +1285,30 @@ apply_run_steps() {
 	return 0
 }
 
+# Deutlicher Hinweis auf den Architekturwechsel, auf dem Schirm und im Log
+_apply_arch_warning() {
+	local line
+	while IFS= read -r line; do
+		_lbb_log WARNING "$line"
+	done <<EOF
+################################################################################
+ARCHITEKTURWECHSEL: Der Clone stammt von $1, dieses System ist $2.
+Das ist ein Risiko. Programme und Bibliotheken aus dem Clone passen nicht zu
+dieser Architektur. lbclone spielt sie deshalb nicht ein, sondern verlässt sich
+auf den Installer und auf die Neuinstallation der Plugins:
+  - LoxBerry, Node.js und die Python-Umgebungen des Cores kommen vom Installer.
+  - Alle Plugins mit Download-Adresse werden neu installiert, unabhängig von
+    ihrer Autoupdate-Einstellung.
+  - Plugins ohne Download-Adresse oder ohne Unterstützung für $2 bleiben
+    ohne ihre Programmteile und funktionieren dann vermutlich nicht.
+  - Eigene Programme unter /usr/local und Daten, deren Format von der
+    Architektur abhängt, müssen von Hand geprüft werden.
+Nach dem Einspielen alle Plugins und Funktionen sorgfältig prüfen.
+################################################################################
+EOF
+	log_warn "Architekturwechsel $1 → $2: Risiko, siehe Hinweis oben. Alle Plugins und Funktionen prüfen."
+}
+
 _apply_save_options() {
 	state_set INPUT "$(readlink -m "$LBB_INPUT")"
 	state_set VERBOSE "${LBB_VERBOSE:-0}"
@@ -1274,6 +1323,7 @@ _apply_save_options() {
 	state_set NEW_HOSTNAME "${LBB_NEW_HOSTNAME:-}"
 	state_set NEW_LBNAME "${LBB_NEW_LBNAME:-}"
 	state_set UPDATE_CORE "${LBB_UPDATE_CORE:-0}"
+	state_set ARCH_CHANGE "${LBB_ARCH_CHANGE:-0}"
 }
 
 _apply_load_options() {
@@ -1575,14 +1625,24 @@ apply_step_R9() {
 		lbb_read_patterns <(_lbb_conf_etc_restore_exclude)
 		cut -f1 "$(_apply_meta)/etc-symlinks.txt" 2>/dev/null | sed 's|^/||'
 	} > "$list"
-	# Datenbank-Dumps ins Zustandsverzeichnis statt nach /dumps
-	local -a common=(--anchored --exclude-from="$list" --transform="s,^dumps$,${LBB_STATE_DIR#/}/dumps,;s,^dumps/,${LBB_STATE_DIR#/}/dumps/,")
+	lbrel="${META_LB_HOMEDIR#/}"
+	# Hardware-Flags (is_raspberry.cfg, is_hwmodel_*.cfg …) hat der Installer für diese Box geschrieben.
+	# Datenbank-Dumps ins Zustandsverzeichnis statt nach /dumps.
+	local -a common=(--anchored --exclude-from="$list" --exclude="$lbrel/config/system/is_*.cfg"
+		--transform="s,^dumps$,${LBB_STATE_DIR#/}/dumps,;s,^dumps/,${LBB_STATE_DIR#/}/dumps/,")
+	# Architekturwechsel: architekturgebundene Pfade aus create (meta/native.txt) weglassen
+	if [ "$(state_get ARCH_CHANGE)" = 1 ]; then
+		common+=(--no-wildcards --exclude-from="$(_apply_meta)/native.txt" --wildcards)
+	fi
 	if [ "$(state_get ALLOW_CORE_MISMATCH)" = 1 ]; then
-		lbrel="${META_LB_HOMEDIR#/}"
-		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" --exclude="$lbrel" || return 1
-		_apply_extract_userdata_only "$input" "$lbrel" || return 1
+		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" --exclude=usr/local --exclude="$lbrel" || return 1
+		_apply_extract_userdata_only "$input" "$lbrel" "${common[@]}" || return 1
 	else
-		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" || return 1
+		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" --exclude=usr/local || return 1
+	fi
+	# /usr/local: nichts überschreiben, was der Installer schon angelegt hat (z. B. Node.js)
+	if ! archive_extract "$input" - "$(lbb_p /)" "${common[@]}" --skip-old-files usr/local 2>&1 | lbb_output; then
+		log_warn "Dateien unter /usr/local ließen sich nicht vollständig einspielen (Details im Log)."
 	fi
 	rm -f "$list"
 	log_ok "Dateien zurückgespielt."
@@ -1591,6 +1651,7 @@ apply_step_R9() {
 # Nur die Pfade, die ein Core-Update nicht anfasst (config/system/update-exclude.system)
 _apply_extract_userdata_only() {
 	local input="$1" lbrel="$2" line re excl listing
+	shift 2
 	local -a members=()
 	excl="$(lbb_p "/$lbrel")/config/system/update-exclude.system"
 	if [ ! -r "$excl" ]; then
@@ -1618,7 +1679,7 @@ _apply_extract_userdata_only() {
 		return 1
 	fi
 	log_warn "--allow-core-mismatch: nur Konfiguration und Daten aus dem Backup (ungeprüfter Weg)."
-	archive_extract "$input" - "$(lbb_p /)" --wildcards "${members[@]}"
+	archive_extract "$input" - "$(lbb_p /)" "$@" --wildcards "${members[@]}"
 }
 
 # Neue SSH- und Dropbear-Host-Keys, nur für vorhandene Schlüssel
@@ -1747,15 +1808,25 @@ apply_step_R12() {
 	apply_env_load
 	LBB_FORCE_PLUGIN_REINSTALL="$(state_get FORCE_PLUGIN_REINSTALL)"
 	LBB_NO_PLUGIN_REINSTALL="$(state_get NO_PLUGIN_REINSTALL)"
+	LBB_ARCH_CHANGE="$(state_get ARCH_CHANGE)"
 	read -r -a LBB_SKIP_PLUGINS <<< "$(state_get SKIP_PLUGINS)"
 	LBB_REPORT="${LBB_REPORT:-$(_apply_state)/report.txt}"
 	: > "$LBB_REPORT"
-	local work
+	local work folder status
 	work="$(mktemp -d /tmp/lbclone-plugins.XXXXXX)"
 	# plugininstall.pl entpackt das Zip als loxberry (sudo -u loxberry unzip, plugininstall.pl:416)
 	chmod 755 "$work"
 	plugins_reinstall_all "$META_LB_HOMEDIR" "$work" || true
 	rm -rf "$work"
+	# Architekturwechsel: Plugins, deren Programmteile R9 weggelassen hat und die nicht neu installiert wurden
+	if [ "$LBB_ARCH_CHANGE" = 1 ] && [ -r "$(_apply_meta)/native.txt" ]; then
+		while IFS=$'\t' read -r folder status _; do
+			[ -n "$folder" ] && [ "$status" != OK ] || continue
+			if grep -qE "/plugins/${folder}(/|$)" "$(_apply_meta)/native.txt"; then
+				log_warn "$folder: enthält Programmteile für eine andere Architektur und wurde nicht neu installiert – funktioniert vermutlich nicht. Über die WebUI neu installieren."
+			fi
+		done < "$LBB_REPORT"
+	fi
 	return 0
 }
 
@@ -1851,6 +1922,9 @@ etc/network  etc/systemd/network  etc/wpa_supplicant
 # Startlinks auf Init-Skripte noch nicht installierter Pakete; die Pakete legen sie selbst an
 etc/rc?.d
 
+# Hardware der neuen Box: Kernelmodule und udev-Regeln
+etc/modprobe.d  etc/modules-load.d  etc/udev/rules.d
+
 # Laufzeitdateien
 etc/resolv.conf  etc/resolv.conf.*  etc/mtab
 LBB_EOF
@@ -1928,9 +2002,15 @@ sub load_plugins {
 }
 
 sub decide_one {
-	my ($au, $hasrel, $haspre, $force, $none, $skipped) = @_;
+	my ($au, $hasrel, $haspre, $force, $none, $skipped, $all) = @_;
 	return ('skip', '-') if $skipped;
 	return ('keep', '-') if $none;
+	# Architekturwechsel: alles mit Download-Adresse neu installieren, unabhängig von der Stufe
+	if ($all) {
+		return ('reinstall', 'release') if $hasrel && $au ne '4';
+		return ('reinstall', 'auto') if $hasrel || $haspre;
+		return ('nourl', '-');
+	}
 	return ('keep', '-') if $au eq '0';
 	return ('nourl', '-') if !$hasrel && !$haspre;
 	if ($au eq '3') {
@@ -1946,15 +2026,15 @@ sub decide_one {
 
 sub cmd_decide {
 	my @a = @_;
-	my ($db, $meta, $force, $none, @skip);
-	GetOptionsFromArray(\@a, 'db=s' => \$db, 'meta=s' => \$meta, 'force' => \$force, 'none' => \$none, 'skip=s' => \@skip) or return 2;
+	my ($db, $meta, $force, $none, $all, @skip);
+	GetOptionsFromArray(\@a, 'db=s' => \$db, 'meta=s' => \$meta, 'force' => \$force, 'none' => \$none, 'all' => \$all, 'skip=s' => \@skip) or return 2;
 	return 2 unless $db || $meta;
 	my %skip = map { $_ => 1 } @skip;
 	my $p = load_plugins($db, $meta);
 	for my $md5 (sort { ($p->{$a}{folder} // '') cmp ($p->{$b}{folder} // '') } keys %$p) {
 		my $e = $p->{$md5};
 		my $au = (defined $e->{autoupdate} && $e->{autoupdate} ne '') ? "$e->{autoupdate}" : '0';
-		my ($dec, $mode) = decide_one($au, $e->{has_release}, $e->{has_prerelease}, $force, $none, $skip{ $e->{folder} // '' });
+		my ($dec, $mode) = decide_one($au, $e->{has_release}, $e->{has_prerelease}, $force, $none, $skip{ $e->{folder} // '' }, $all);
 		print join("\t", $md5, $e->{folder} // '', $e->{name} // '', $e->{version} // '', $au, $dec, $mode), "\n";
 	}
 	return 0;
