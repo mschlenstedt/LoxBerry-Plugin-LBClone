@@ -1,0 +1,2148 @@
+#!/bin/bash
+# lbclone — einen LoxBerry ohne Image klonen.
+#   lbclone create  erfasst einen LoxBerry (ohne Betriebssystem) in einem Archiv
+#   lbclone apply   spielt ihn auf ein frisches DietPi – als Ersatz oder als zweite Box
+# Eine einzige Datei: herunterladen (wget/curl) und mit bash ausführen. Hilfe: lbclone --help
+#
+# Wird die Datei mit "source" geladen (Tests), definiert sie nur die Funktionen.
+
+LBB_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+# ============================================================ common
+
+# Gemeinsame Helfer für lbclone. Wird von bin/lbclone und den Tests per source geladen.
+
+export LC_ALL=C
+
+LBB_EXIT_OK=0
+LBB_EXIT_WARN=1
+LBB_EXIT_PRECOND=2
+LBB_EXIT_ABORT=3
+
+LBB_WARNINGS=0
+: "${LBB_ROOT:=}"
+: "${LBB_LOGFILE:=}"
+
+LBB_PLUGIN_EXCLUDES=()
+LBB_STOP_SERVICES=()
+: "${LBB_NO_LOGS:=0}"
+: "${LBB_COMPRESS:=7z}"
+
+# Pfad unter dem (Test-)Root
+lbb_p() {
+	printf '%s%s' "$LBB_ROOT" "$1"
+}
+
+_lbb_log() {
+	local tag="$1" line
+	shift
+	line="$(date '+%Y-%m-%d %H:%M:%S') <$tag> $*"
+	printf '%s\n' "$line"
+	if [ -n "$LBB_LOGFILE" ]; then
+		printf '%s\n' "$line" >> "$LBB_LOGFILE"
+	fi
+}
+log_ok()   { _lbb_log OK "$@"; }
+log_info() { _lbb_log INFO "$@"; }
+log_warn() {
+	LBB_WARNINGS=$((LBB_WARNINGS + 1))
+	_lbb_log WARNING "$@"
+	# Warnungen über Neustarts hinweg sammeln (Restore)
+	if [ -n "${LBB_WARNFILE:-}" ]; then
+		printf '%s\n' "$*" >> "$LBB_WARNFILE"
+	fi
+}
+log_err()  { _lbb_log ERROR "$@"; }
+
+# --verbose: gesprächige Ausgabe (Schritte, Befehle, Dateilisten)
+: "${LBB_VERBOSE:=0}"
+log_debug() {
+	if [ "$LBB_VERBOSE" = 1 ]; then
+		_lbb_log DEBUG "$@"
+	fi
+}
+
+# Befehlsausgabe (apt, Installer, plugininstall): ins Log und bei --verbose zusätzlich auf den Schirm
+lbb_output() {
+	if [ "$LBB_VERBOSE" = 1 ]; then
+		tee -a "${LBB_LOGFILE:-/dev/null}"
+	else
+		cat >> "${LBB_LOGFILE:-/dev/null}"
+	fi
+}
+
+# Befehl ausführen, Ausgabe ins Log (mit --verbose auch auf den Schirm); Exitcode des Befehls
+lbb_logged() {
+	"$@" 2>&1 | lbb_output
+	return "${PIPESTATUS[0]}"
+}
+
+# Wie lbb_output, aber immer auch auf dem Schirm – für lange Läufe (Installer), damit man sieht, dass es weitergeht
+lbb_output_always() {
+	tee -a "${LBB_LOGFILE:-/dev/null}"
+}
+
+# Fehlende Werkzeuge per apt nachinstallieren: lbb_ensure_tools <befehl>:<paket> …
+lbb_ensure_tools() {
+	local spec cmd pkg
+	local -a missing=()
+	for spec in "$@"; do
+		cmd="${spec%%:*}"
+		pkg="${spec#*:}"
+		if ! command -v "$cmd" > /dev/null 2>&1; then
+			missing+=("$pkg")
+		fi
+	done
+	[ "${#missing[@]}" -eq 0 ] && return 0
+	log_info "Installiere fehlende Werkzeuge: ${missing[*]}"
+	if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" 2>&1 | lbb_output ||
+		! _lbb_tools_present "$@"; then
+		# Paketlisten evtl. veraltet (frisches DietPi): einmal aktualisieren und erneut versuchen
+		apt-get update 2>&1 | lbb_output
+		DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" 2>&1 | lbb_output
+	fi
+	_lbb_tools_present "$@" || die "$LBB_EXIT_PRECOND" "Werkzeuge fehlen und ließen sich nicht installieren: ${missing[*]}"
+	log_ok "Werkzeuge installiert: ${missing[*]}"
+}
+
+_lbb_tools_present() {
+	local spec
+	for spec in "$@"; do
+		command -v "${spec%%:*}" > /dev/null 2>&1 || return 1
+	done
+}
+
+die() {
+	local code="$1"
+	shift
+	_lbb_log FAIL "$@"
+	exit "$code"
+}
+
+lbb_final_exit() {
+	if [ "$LBB_WARNINGS" -gt 0 ]; then
+		exit "$LBB_EXIT_WARN"
+	fi
+	exit "$LBB_EXIT_OK"
+}
+
+lbb_require_root() {
+	if [ "$EUID" -ne 0 ] && [ "${LBB_ALLOW_NONROOT:-0}" != 1 ]; then
+		die "$LBB_EXIT_PRECOND" "lbclone muss als root laufen."
+	fi
+}
+
+# LBHOMEDIR aus /etc/environment; leer, wenn kein LoxBerry installiert ist
+lbb_lbhomedir() {
+	local env
+	env="$(lbb_p /etc/environment)"
+	[ -r "$env" ] || return 0
+	sed -n 's/^LBHOMEDIR=//p' "$env" | tail -n 1 | tr -d '"'
+}
+
+# Glob-Vergleich für Filterlisten: ** passt über Verzeichnisgrenzen, * und ? nicht.
+lbb_glob_match() {
+	local pattern="$1" path="$2" re
+	re="$(printf '%s' "$pattern" | sed \
+		-e 's/[].[\^$+(){}|]/\\&/g' \
+		-e 's/\*\*/\x01/g' \
+		-e 's/\*/[^\/]*/g' \
+		-e 's/?/[^\/]/g' \
+		-e 's/\x01/.*/g')"
+	[[ "$path" =~ ^${re}$ ]]
+}
+
+# Ein Muster pro Zeile; Kommentare (#…) und Leerzeilen fallen weg.
+lbb_read_patterns() {
+	sed -e 's/#.*$//' "$1" | tr -s ' \t' '\n\n' | sed '/^$/d'
+}
+
+lbb_match_any() {
+	local path="$1" pat
+	shift
+	for pat in "$@"; do
+		if lbb_glob_match "$pat" "$path"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Dauerhafte Voreinstellungen: Zeilen "schlüssel = wert"
+lbb_load_config() {
+	local k v
+	[ -r "$1" ] || return 0
+	while IFS='=' read -r k v; do
+		k="$(printf '%s' "$k" | tr -d ' \t')"
+		v="$(printf '%s' "$v" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+		case "$k" in
+			''|\#*) ;;
+			exclude-plugin-data) LBB_PLUGIN_EXCLUDES+=("$v") ;;
+			stop-service) LBB_STOP_SERVICES+=("$v") ;;
+			no-logs) LBB_NO_LOGS="$v" ;;
+			compress) LBB_COMPRESS="$v" ;;
+			*) log_warn "Unbekannter Schlüssel in $1: $k" ;;
+		esac
+	done < "$1"
+}
+
+# ============================================================ collect
+
+# Sammelt, was ein LoxBerry gegenüber einer frischen Installation zusätzlich hat.
+
+# Alle manuell installierten Pakete – kein Abgleich mit der Installer-Liste: apt überspringt
+# beim Restore selbst, was schon da ist. Nur hardwaregebundene Pakete fallen weg (Ausschlussliste).
+collect_manual_packages() {
+	local excl="$1" pkg
+	local -a pats=()
+	mapfile -t pats < <(lbb_read_patterns "$excl")
+	apt-mark showmanual | sed 's/:.*$//' | sort -u |
+	while IFS= read -r pkg; do
+		if ! lbb_match_any "$pkg" "${pats[@]}"; then
+			printf '%s\n' "$pkg"
+		fi
+	done
+}
+
+# Pakete ohne Repo-Quelle: name<TAB>version<TAB>arch
+collect_local_packages() {
+	apt list --installed 2>/dev/null | awk '/\[installed,local\]/ {
+		split($1, a, "/")
+		print a[1] "\t" $2 "\t" $3
+	}'
+}
+
+# Sucht ein .deb mit genau diesem Paket, dieser Version und Architektur
+find_deb_for() {
+	local pkg="$1" ver="$2" arch="$3" dir f
+	shift 3
+	for dir in "$@"; do
+		[ -d "$dir" ] || continue
+		while IFS= read -r f; do
+			if [ "$(dpkg-deb -f "$f" Package 2>/dev/null)" = "$pkg" ] &&
+				[ "$(dpkg-deb -f "$f" Version 2>/dev/null)" = "$ver" ] &&
+				[ "$(dpkg-deb -f "$f" Architecture 2>/dev/null)" = "$arch" ]; then
+				printf '%s\n' "$f"
+				return 0
+			fi
+		done < <(find "$dir" -type f -name "${pkg}_*.deb" 2>/dev/null | sort)
+	done
+	return 1
+}
+
+collect_holds() {
+	apt-mark showhold
+}
+
+# Alle Pfade aus der dpkg-Datenbank, die mit <präfix> beginnen
+dpkg_owned_paths() {
+	cat "$(lbb_p /var/lib/dpkg/info)"/*.list 2>/dev/null | grep -F -- "$1" | grep "^$1" | sort -u
+}
+
+# Symlinks in /etc, die nach LBHOMEDIR zeigen: link<TAB>ziel
+collect_etc_symlinks() {
+	local lbhome="$1" l t
+	find "$(lbb_p /etc)" -xdev -type l 2>/dev/null | sort | while IFS= read -r l; do
+		t="$(readlink "$l")"
+		case "$t" in
+			"$lbhome"|"$lbhome"/*) printf '%s\t%s\n' "${l#"$LBB_ROOT"}" "$t" ;;
+		esac
+	done
+}
+
+collect_user_groups() {
+	id -nG "$1" | tr ' ' '\n' | sed '/^$/d' | sort
+}
+
+# Persönliche Benutzer: name:uid:home:shell:gruppen
+collect_extra_users() {
+	local name uid home shell
+	getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $1 != "loxberry" && $1 != "dietpi" {
+		print $1 ":" $3 ":" $6 ":" $7
+	}' | while IFS=: read -r name uid home shell; do
+		printf '%s:%s:%s:%s:%s\n' "$name" "$uid" "$home" "$shell" "$(id -nG "$name" | tr ' ' ',')"
+	done
+}
+
+collect_passwd_hashes() {
+	getent shadow root loxberry | cut -d: -f1,2
+}
+
+collect_dietpi_software() {
+	local f
+	f="$(lbb_p /boot/dietpi/.installed)"
+	[ -r "$f" ] || return 0
+	sed -n 's/^aSOFTWARE_INSTALL_STATE\[\([0-9]*\)\]=2$/\1/p' "$f" | sort -n
+}
+
+# Datenverzeichnisse /var/lib/<paket> nur für Pakete, die nicht in der Installer-Liste
+# (packages<VERSION_ID>.txt) stehen – alles andere legt die frische Installation selbst an.
+# mosquitto und mysql haben eigene Wege (Snapshot nach SIGUSR1 bzw. Dump).
+collect_var_lib_dirs() {
+	local manual="$1" ref="$2" pkg
+	comm -23 \
+		<(sort -u "$manual") \
+		<(awk '/^ii /{print $2}' "$ref" | sed 's/:.*$//' | sort -u) |
+	while IFS= read -r pkg; do
+		case "$pkg" in ''|mosquitto|mysql) continue ;; esac
+		if [ -d "$(lbb_p "/var/lib/$pkg")" ]; then
+			printf 'var/lib/%s\n' "$pkg"
+		fi
+	done
+}
+
+# Relative Pfade optionaler Bereiche, nur wenn vorhanden und nicht leer bzw. nicht nur Standard
+collect_optional_dirs() {
+	local d
+	for d in var/spool/cron/crontabs mnt/dietpi_userdata; do
+		if [ -n "$(find "$(lbb_p "/$d")" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+			printf '%s\n' "$d"
+		fi
+	done
+	if [ -n "$(find "$(lbb_p /var/www)" -type f ! -path '*/html/index.html' -print -quit 2>/dev/null)" ]; then
+		printf 'var/www\n'
+	fi
+}
+
+# ============================================================ meta
+
+# Manifest eines Clones: meta.json (gelesen mit jq; fehlt jq, installiert lbclone es nach)
+# und SHA256SUMS.
+
+_meta_os_release() {
+	sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$(lbb_p /etc/os-release)" 2>/dev/null | head -n 1
+}
+
+meta_collect_system() {
+	META_FORMAT=1
+	META_OS_ID="$(_meta_os_release ID)"
+	META_OS_VERSION_ID="$(_meta_os_release VERSION_ID)"
+	META_OS_CODENAME="$(_meta_os_release VERSION_CODENAME)"
+	META_DEBIAN_VERSION="$(cat "$(lbb_p /etc/debian_version)" 2>/dev/null)"
+	META_ARCH="$(dpkg --print-architecture)"
+	META_LB_HOMEDIR="$1"
+	META_LB_VERSION="$(jq -r '.Base.Version // empty' "$(lbb_p "$1")/config/system/general.json" 2>/dev/null)"
+	META_HOSTNAME="$(cat "$(lbb_p /etc/hostname)" 2>/dev/null)"
+	META_PAYLOAD_BYTES="${META_PAYLOAD_BYTES:-0}"
+	# Die loxberryid selbst wird nie geklont; apply legt eine neue an, wenn die Quelle eine hatte
+	if [ -e "$(lbb_p "$1")/config/system/loxberryid.cfg" ]; then
+		META_HAS_LOXBERRYID=1
+	else
+		META_HAS_LOXBERRYID=0
+	fi
+}
+
+# Setzt die META_*-Variablen aus meta.json. Trenner \037, damit leere Werte nichts verschieben.
+meta_read_json() {
+	local k v
+	while IFS=$'\037' read -r k v; do
+		printf -v "META_$k" '%s' "$v"
+	done < <(jq -r '[
+		["FORMAT", .format], ["OS_ID", .os.id], ["OS_VERSION_ID", .os.version_id],
+		["OS_CODENAME", .os.codename], ["DEBIAN_VERSION", .os.debian_version], ["ARCH", .arch],
+		["LB_VERSION", .loxberry.version], ["LB_HOMEDIR", .loxberry.homedir], ["HOSTNAME", .hostname],
+		["PAYLOAD_BYTES", .sizes.payload_bytes], ["HAS_LOXBERRYID", .has_loxberryid]
+	][] | map(if . == null then "" else tostring end) | join("\u001f")' "$1")
+}
+
+# V0: mindestens Debian 13 und LoxBerry 4
+meta_check_v0() {
+	local os="${META_OS_VERSION_ID%%.*}" lb="${META_LB_VERSION%%.*}"
+	[[ "$os" =~ ^[0-9]+$ && "$lb" =~ ^[0-9]+$ ]] || return 1
+	[ "$os" -ge 13 ] && [ "$lb" -ge 4 ]
+}
+
+meta_write_json() {
+	local out="$1" db="$2" plugins='[]'
+	if [ -r "$db" ]; then
+		plugins="$(jq '[.plugins | to_entries[] | {
+			md5: .key,
+			folder: .value.folder,
+			name: .value.name,
+			version: .value.version,
+			autoupdate: ((.value.autoupdate // "0") | tostring),
+			has_release: ((.value.releasecfg // "") != ""),
+			has_prerelease: ((.value.prereleasecfg // "") != "")
+		}]' "$db")"
+	fi
+	jq -n \
+		--arg created "$(date --iso-8601=seconds)" \
+		--arg hostname "$META_HOSTNAME" \
+		--arg os_id "$META_OS_ID" --arg os_ver "$META_OS_VERSION_ID" \
+		--arg deb "$META_DEBIAN_VERSION" --arg codename "$META_OS_CODENAME" \
+		--arg arch "$META_ARCH" --arg lbver "$META_LB_VERSION" --arg lbhome "$META_LB_HOMEDIR" \
+		--arg bytes "${META_PAYLOAD_BYTES:-0}" --arg hasid "${META_HAS_LOXBERRYID:-0}" \
+		--argjson plugins "$plugins" \
+		'{format: 1, created: $created, hostname: $hostname,
+		  os: {id: $os_id, version_id: $os_ver, debian_version: $deb, codename: $codename},
+		  arch: $arch, loxberry: {version: $lbver, homedir: $lbhome},
+		  plugins: $plugins, sizes: {payload_bytes: ($bytes | tonumber)},
+		  has_loxberryid: ($hasid | tonumber)}' > "$out"
+}
+
+meta_write_sums() {
+	( cd "$1" && find meta -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 -r sha256sum > meta/SHA256SUMS )
+}
+
+meta_check_sums() {
+	( cd "$1" && sha256sum --quiet -c meta/SHA256SUMS > /dev/null 2>&1 )
+}
+
+# ============================================================ archive
+
+# Clone-Archiv (7z Standard, zip, tar.gz). Aufbau – unter Windows wie Linux entpackbar:
+#
+#   lbclone          dieses Skript (eine Datei)
+#   loxberry.tar     der eigentliche Clone (bei Verschlüsselung loxberry.tar.gpg)
+#
+# loxberry.tar bleibt beim Entpacken ein tar: nur tar bewahrt Eigentümer und Rechte.
+# Sein erstes Member ist meta.tar (Manifest), danach die Payload relativ zu /.
+# Lesen geht aus dem ganzen Archiv oder direkt aus einem entpackten loxberry.tar[.gpg].
+
+LBB_INNER=loxberry.tar
+
+# Endung des äußeren Archivs: archive_ext <7z|zip|gz>
+archive_ext() {
+	case "$1" in
+		zip) echo zip ;;
+		gz) echo tar.gz ;;
+		*) echo 7z ;;
+	esac
+}
+
+# Werkzeug für eine Kompression bzw. ein Archiv (Format für lbb_ensure_tools)
+archive_tools() {
+	case "$1" in
+		7z|zip|*.7z|*.zip) echo 7z:7zip ;;
+		gz|*.tar.gz) echo gzip:gzip ;;
+		*) echo tar:tar ;;
+	esac
+}
+
+# Name des inneren Clones in einem äußeren Archiv (…/loxberry.tar oder …/loxberry.tar.gpg)
+_arch_member() {
+	case "$1" in
+		*.7z|*.zip)
+			7z l -ba "$1" 2>/dev/null | awk '{print $NF}' | grep -m1 -E "(^|/)$LBB_INNER(\.gpg)?$"
+			;;
+		*.tar.gz)
+			gzip -dc "$1" 2>/dev/null | tar -tf - 2>/dev/null | grep -m1 -E "(^|/)$LBB_INNER(\.gpg)?$"
+			;;
+		*) basename "$1" ;;
+	esac
+}
+
+archive_is_encrypted() {
+	case "$(_arch_member "$1")" in *.gpg) return 0 ;; esac
+	return 1
+}
+
+# Ohne Passphrase-Datei würde gpg auf eine Eingabe warten, die nie kommt
+archive_require_pass() {
+	if archive_is_encrypted "$1" && { [ -z "${2:-}" ] || [ "$2" = "-" ]; }; then
+		die 2 "Der Clone ist verschlüsselt: --passphrase-file angeben."
+	fi
+}
+
+# archive_create <ausgabe> <arbeitsordner> <7z|zip|gz> <passfile|-> <exclude-datei> <payload-liste> [zwischenablage]
+# Status 0 ok, 1 Warnung von tar, 3 Fehler (dann ist <ausgabe> gelöscht).
+archive_create() {
+	local out="$1" work="$2" comp="$3" pass="$4" excl="$5" list="$6" stage="${7:-}" line rc inner
+	local -a snap=() dumps=() verbose=()
+	inner="$LBB_INNER"
+	[ "$pass" != "-" ] && inner="$inner.gpg"
+	# Momentaufnahmen: nur die in snap.list genannten Pfade, ohne ihre Elternverzeichnisse
+	if [ -s "$work/snap.list" ]; then
+		snap=(-C "$work/snap" --files-from="$work/snap.list")
+	fi
+	# Datenbank-Dumps (Zwischenablage auf dem Zielmedium) als dumps/…
+	if [ -n "$stage" ] && [ -d "$stage/dumps" ]; then
+		dumps=(-C "$stage" dumps)
+	fi
+	if [ "${LBB_VERBOSE:-0}" = 1 ]; then
+		verbose=(--verbose --index-file="$work/tar-index.txt")
+	fi
+	# Das Werkzeug (dieses Skript) ins Wurzelverzeichnis des Archivs
+	rm -rf "$work/pkg"
+	mkdir -p "$work/pkg"
+	install -m 755 "$LBB_SELF" "$work/pkg/lbclone" || return 3
+	rm -f "$out"
+	(
+		umask 077
+		_arch_inner_stream() {
+			tar --create --file=- --format=gnu "${verbose[@]}" \
+				--warning=no-file-changed --warning=no-file-removed --ignore-failed-read \
+				--anchored --exclude-from="$excl" \
+				-C "$work" meta.tar "${snap[@]}" "${dumps[@]}" \
+				-C "$(lbb_p /)" --files-from="$list" \
+				2> "$work/tar-warnings.txt"
+			echo "$?" > "$work/tar-status"
+		}
+		_arch_encrypt() {
+			if [ "$pass" != "-" ]; then
+				gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$pass" --symmetric --cipher-algo AES256 -o -
+			else
+				cat
+			fi
+		}
+		case "$comp" in
+			gz)
+				# tar.gz braucht die Größe von loxberry.tar vorab: Zwischendatei auf dem Zielmedium
+				tmp="$(mktemp -d "$(dirname "$out")/.lbclone-gz.XXXXXX")" || exit 3
+				trap 'rm -rf "$tmp"' EXIT
+				cp -p "$work/pkg/lbclone" "$tmp/"
+				_arch_inner_stream | _arch_encrypt > "$tmp/$inner" || exit 3
+				tar -C "$tmp" -cf - lbclone "$inner" | gzip -c > "$out" || exit 3
+				;;
+			*)
+				t=7z
+				[ "$comp" = zip ] && t=zip
+				( cd "$work/pkg" && 7z a -t"$t" -bd -bso0 -bsp0 "$out" lbclone ) || exit 3
+				_arch_inner_stream | _arch_encrypt | 7z a -t"$t" -bd -bso0 -bsp0 -si"$inner" "$out"
+				st=("${PIPESTATUS[@]}")
+				[ "${st[1]}" = 0 ] && [ "${st[2]}" = 0 ] || exit 3
+				;;
+		esac
+		case "$(cat "$work/tar-status" 2>/dev/null)" in
+			0) exit 0 ;;
+			1) exit 1 ;;
+			*) exit 3 ;;
+		esac
+	)
+	rc=$?
+	[ "$rc" -ge 3 ] && rm -f "$out"
+	if [ -s "$work/tar-index.txt" ]; then
+		while IFS= read -r line; do
+			log_debug "  + $line"
+		done < "$work/tar-index.txt"
+	fi
+	return "$rc"
+}
+
+# Inneres loxberry.tar als tar-Strom auf stdout: archive_stream <datei> <passfile|->
+# <datei> ist das ganze Archiv (7z, zip, tar.gz) oder ein entpacktes loxberry.tar[.gpg].
+archive_stream() {
+	local f="$1" pass="${2:--}" member
+	member="$(_arch_member "$f")"
+	[ -n "$member" ] || { log_err "Kein $LBB_INNER in $f gefunden."; return 2; }
+	(
+		set -o pipefail
+		case "$f" in
+			*.7z|*.zip) 7z x -so -bd "$f" "$member" 2>/dev/null ;;
+			*.tar.gz) gzip -dc "$f" | tar -xOf - "$member" ;;
+			*) cat "$f" ;;
+		esac | if [ "${member%.gpg}" != "$member" ]; then
+			gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$pass" -d
+		else
+			cat
+		fi
+	)
+}
+
+# archive_read_meta <datei> <passfile|-> <ziel> – liest nur das erste Member (meta.tar)
+archive_read_meta() {
+	mkdir -p "$3"
+	archive_stream "$1" "$2" 2>/dev/null | tar -x -O --occurrence=1 -f - meta.tar 2>/dev/null | tar -x -C "$3" -f -
+	[ -r "$3/meta/meta.json" ]
+}
+
+# archive_extract <datei> <passfile|-> <ziel> [tar-optionen/member…]
+archive_extract() {
+	local a="$1" p="$2" dest="$3"
+	shift 3
+	local -a own=() verbose=()
+	if [ "$EUID" -eq 0 ]; then
+		own=(--same-owner --same-permissions)
+	fi
+	if [ "${LBB_VERBOSE:-0}" = 1 ]; then
+		verbose=(--verbose)
+	fi
+	archive_stream "$a" "$p" | tar -x -f - -C "$dest" "${own[@]}" "${verbose[@]}" --exclude=meta.tar "$@"
+	local -a st=("${PIPESTATUS[@]}")
+	[ "${st[0]}" = 0 ] || return "${st[0]}"
+	return "${st[1]}"
+}
+
+# archive_verify <datei> <passfile|-> <arbeitsordner>
+archive_verify() {
+	local a="$1" p="$2" work="$3"
+	# Das ganze Archiv, auch der Werkzeug-Teil – ein kaputtes lbclone/ nützt beim Restore nichts
+	case "$a" in
+		*.7z|*.zip) 7z t -bd -bso0 -bsp0 "$a" > /dev/null 2>&1 || return 1 ;;
+		*.tar.gz) gzip -t "$a" 2>/dev/null || return 1 ;;
+	esac
+	archive_stream "$a" "$p" | tar -t -f - > /dev/null
+	local -a st=("${PIPESTATUS[@]}")
+	[ "${st[0]}" = 0 ] && [ "${st[1]}" = 0 ] || return 1
+	archive_read_meta "$a" "$p" "$work" || return 1
+	meta_check_sums "$work"
+}
+
+# ============================================================ installer
+
+# LoxBerry-Installer finden, aufrufen und prüfen (SPEC 6.0).
+
+: "${LBB_INSTALLER_REPO:=https://raw.githubusercontent.com/mschlenstedt/Loxberry_Installer/main}"
+: "${LBB_RELEASE_API:=https://api.github.com/repos/mschlenstedt/Loxberry/releases/tags}"
+: "${LBB_INSTALLER_NONINTERACTIVE:=0}"
+: "${LBB_INSTALLER_API:=https://api.github.com/repos/mschlenstedt/Loxberry_Installer/commits}"
+
+# Commit von main, aus dem das Installer-Skript stammt (fürs Log)
+installer_commit() {
+	local -a auth=()
+	mapfile -t auth < <(_installer_auth)
+	curl -fsSL --max-time 30 "${auth[@]}" "$LBB_INSTALLER_API?path=$1&per_page=1" 2>/dev/null \
+		| jq -r '.[0].sha // empty' 2>/dev/null | grep . || echo unbekannt
+}
+
+installer_script_name() {
+	printf 'install_%s_v%s.sh\n' "$1" "${2%%.*}"
+}
+
+installer_url() {
+	printf '%s/%s\n' "$LBB_INSTALLER_REPO" "$1"
+}
+
+_installer_auth() {
+	if [ -n "${LBB_GITHUB_AUTH:-}" ]; then
+		printf '%s\n' -u "$LBB_GITHUB_AUTH"
+	fi
+}
+
+installer_available() {
+	curl -fsIL --max-time 30 "$(installer_url "$1")" > /dev/null
+}
+
+installer_release_exists() {
+	local -a auth=()
+	mapfile -t auth < <(_installer_auth)
+	curl -fsL --max-time 30 "${auth[@]}" "$LBB_RELEASE_API/$1" > /dev/null
+}
+
+installer_run() {
+	local script="$1" ver="$2" dir="$3" f
+	local -a args=(-t "$ver") auth=()
+	f="$dir/$script"
+	mkdir -p "$dir"
+	curl -fsSL --max-time 120 -o "$f" "$(installer_url "$script")" || return 1
+	mapfile -t auth < <(_installer_auth)
+	args+=("${auth[@]}")
+	if [ "$LBB_INSTALLER_NONINTERACTIVE" = 1 ]; then
+		args+=(--non-interactive)
+	fi
+	TERM=dumb bash "$f" "${args[@]}" < /dev/null
+}
+
+installer_verify() {
+	local ver="$1" home="$2" lbhome have
+	lbhome="$(lbb_lbhomedir)"
+	if [ "$lbhome" != "$home" ]; then
+		log_err "Nach der Installation ist LBHOMEDIR '$lbhome', erwartet '$home'."
+		return 1
+	fi
+	have="$(jq -r '.Base.Version // empty' "$(lbb_p "$lbhome")/config/system/general.json" 2>/dev/null)"
+	if [ "$have" != "$ver" ]; then
+		log_err "Installiert ist LoxBerry '$have', erwartet $ver."
+		return 1
+	fi
+}
+
+# ============================================================ plugins
+
+# Plugin-Phase (SPEC 6.2, 6.3). Der Restore liest die Plugin-Datenbank nur.
+
+_lbb_perl() {
+	local lbhome
+	lbhome="${LBB_LBHOME:-$(lbb_lbhomedir)}"
+	LBHOMEDIR="$(lbb_p "${lbhome:-/nonexistent}")" \
+	PERL5LIB="${LBB_PERL5LIB:-$(lbb_p "$lbhome")/libs/perllib}" \
+		perl <(_lbb_perl_code) "$@"
+}
+
+# plugins_decide (--db <datei> | --meta <meta.json>) → md5 folder name version autoupdate decision mode
+plugins_decide() {
+	local -a args=(decide "$@")
+	local s
+	[ "${LBB_FORCE_PLUGIN_REINSTALL:-0}" = 1 ] && args+=(--force)
+	[ "${LBB_NO_PLUGIN_REINSTALL:-0}" = 1 ] && args+=(--none)
+	for s in "${LBB_SKIP_PLUGINS[@]}"; do
+		args+=(--skip "$s")
+	done
+	_lbb_perl "${args[@]}"
+}
+
+: "${LBB_REPORT:=}"
+
+_report() {
+	if [ -n "$LBB_REPORT" ]; then
+		printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$LBB_REPORT"
+	fi
+}
+
+plugin_reinstall_one() {
+	local lbhome="$1" md5="$2" folder="$3" version="$4" mode="$5" work="$6"
+	local shadow live d relurl preurl pick type pver url rc now
+	shadow="$(lbb_p "$lbhome")/data/system/plugindatabase.json-"
+	live="$(lbb_p "$lbhome")/data/system/plugindatabase.json"
+	d="$work/$folder"
+	rm -rf "$d"
+	mkdir -p "$d"
+
+	relurl="$(jq -r --arg m "$md5" '.plugins[$m].releasecfg // ""' "$shadow")"
+	preurl="$(jq -r --arg m "$md5" '.plugins[$m].prereleasecfg // ""' "$shadow")"
+	if [ -n "$relurl" ]; then
+		lbb_logged curl -fsSL --max-time 60 -o "$d/release.cfg" "$relurl" || rm -f "$d/release.cfg"
+	fi
+	if [ "$mode" = auto ] && [ -n "$preurl" ]; then
+		lbb_logged curl -fsSL --max-time 60 -o "$d/prerelease.cfg" "$preurl" || rm -f "$d/prerelease.cfg"
+	fi
+	if [ ! -s "$d/release.cfg" ] && [ ! -s "$d/prerelease.cfg" ]; then
+		log_err "$folder: Versionsdatei des Plugins nicht ladbar: ${relurl:-$preurl} – das Plugin bleibt im zurückgespielten Stand."
+		_report "$folder" FEHLER "Versionsdatei nicht ladbar (${relurl:-$preurl})"
+		return 1
+	fi
+	if ! pick="$(_lbb_perl pick --mode "$mode" --installed "$version" --release "$d/release.cfg" --prerelease "$d/prerelease.cfg")"; then
+		log_err "$folder: angebotene Version ist älter als die installierte $version – das Plugin bleibt im zurückgespielten Stand."
+		_report "$folder" FEHLER "keine Version ab $version angeboten"
+		return 1
+	fi
+	IFS=$'\t' read -r type pver url <<< "$pick"
+	if ! lbb_logged curl -fsSL --max-time 600 -o "$d/plugin.zip" "$url"; then
+		log_err "$folder: Plugin-Archiv nicht ladbar: $url – das Plugin bleibt im zurückgespielten Stand."
+		_report "$folder" FEHLER "Download ($url)"
+		return 1
+	fi
+
+	log_info "$folder: installiere $pver ($type) über plugininstall.pl"
+	"$(lbb_p "$lbhome")/sbin/plugininstall.pl" action=autoupdate pid="$md5" file="$d/plugin.zip" \
+		< /dev/null 2>&1 | lbb_output_always
+	rc="${PIPESTATUS[0]}"
+	rm -f "$d/plugin.zip"
+	if [ "$rc" != 0 ]; then
+		log_err "$folder: Installation fehlgeschlagen (plugininstall.pl, Exitcode $rc; Ausgabe siehe oben und im Log $LBB_LOGFILE)."
+		_report "$folder" FEHLER "Installation (Exitcode $rc)"
+		return 2
+	fi
+	now="$(_lbb_perl version --db "$live" --md5 "$md5")"
+	if [ "$now" != "$pver" ]; then
+		log_err "$folder: nach der Installation Version $now, erwartet $pver."
+		_report "$folder" FEHLER "Versionsprüfung ($now statt $pver)"
+		return 3
+	fi
+	log_ok "$folder: $version -> $pver ($type)"
+	_report "$folder" OK "$version -> $pver ($type)"
+	return 0
+}
+
+plugins_reinstall_all() {
+	local lbhome="$1" work="$2" failed=0
+	local md5 folder name version au dec mode shadow
+	shadow="$(lbb_p "$lbhome")/data/system/plugindatabase.json-"
+	mkdir -p "$work"
+	# Trenner \037 statt Tab: Tab ist für read Leerraum und fasst leere Felder zusammen
+	while IFS=$'\037' read -r -u 3 md5 folder name version au dec mode; do
+		case "$dec" in
+			reinstall)
+				plugin_reinstall_one "$lbhome" "$md5" "$folder" "$version" "$mode" "$work" || failed=1
+				;;
+			nourl)
+				log_warn "$folder: autoupdate=$au, aber keine URL — nur Zustands-Restore."
+				_report "$folder" nourl "autoupdate=$au"
+				;;
+			*)
+				log_info "$folder: $dec (autoupdate=$au)"
+				_report "$folder" "$dec" "autoupdate=$au"
+				;;
+		esac
+	done 3< <(LBB_LBHOME="$lbhome" plugins_decide --db "$shadow" | tr '\t' '\037')
+	if [ "$failed" = 1 ]; then
+		log_warn "Mindestens ein Plugin wurde nicht neu installiert (siehe Bericht)."
+		return 1
+	fi
+	return 0
+}
+
+# ============================================================ create
+
+# Ablauf "lbclone create" (SPEC 7).
+
+# Diese Quellen legt install_trixie_v4.sh selbst an (Z. 359, 370, 376)
+LBB_INSTALLER_SOURCES="sury-php.sources yarn.list cloudflared.list"
+
+_BACKUP_STOPPED=()
+# Arbeitsordner global, damit die EXIT-Falle ihn nach dem Ende der Funktion noch kennt
+_LBB_WORK=""
+# Zwischenablage für Datenbank-Dumps auf dem Zielmedium (nicht im tmpfs /tmp)
+_LBB_STAGE=""
+# Archiv, das noch nicht fertig geprüft ist – wird bei Abbruch gelöscht
+_LBB_OUT=""
+
+# Mosquitto schreibt seine Datenbank auf SIGUSR1 (mosquitto(8)), atomar über mosquitto.db.new
+_create_flush_mosquitto() {
+	local pid db before i
+	pid="$(systemctl show -p MainPID --value mosquitto 2>/dev/null)"
+	db="$(lbb_p /var/lib/mosquitto/mosquitto.db)"
+	if ! [ "${pid:-0}" -gt 0 ] 2>/dev/null; then
+		log_info "mosquitto läuft nicht; Datenbank wird so gesichert, wie sie ist."
+		return 0
+	fi
+	before="$(stat -c %.9Y "$db" 2>/dev/null || echo 0)"
+	kill -USR1 "$pid" || { log_warn "mosquitto (PID $pid) nahm SIGUSR1 nicht an."; return 0; }
+	for i in $(seq 1 50); do
+		if [ "$(stat -c %.9Y "$db" 2>/dev/null || echo 0)" != "$before" ]; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	log_warn "mosquitto hat seine Datenbank nicht innerhalb von 10 s geschrieben; gesichert wird der letzte Stand."
+}
+
+# MariaDB im laufenden Betrieb konsistent sichern (InnoDB: --single-transaction, keine Dateikopie)
+_create_dump_mariadb() {
+	local stage="$1"
+	systemctl is-active --quiet mariadb || return 0
+	command -v mariadb-dump > /dev/null || { log_warn "mariadb läuft, aber mariadb-dump fehlt – Datenbank wird nicht gesichert."; return 0; }
+	mkdir -p "$stage/dumps"
+	log_info "Sichere MariaDB per mariadb-dump (ohne Stopp)"
+	if ! ( umask 077; mariadb-dump --single-transaction --all-databases --routines --events > "$stage/dumps/mariadb.sql" ); then
+		log_warn "mariadb-dump fehlgeschlagen – die Datenbank fehlt im Backup."
+		rm -f "$stage/dumps/mariadb.sql"
+	fi
+}
+
+_create_restart_services() {
+	local s
+	for s in "${_BACKUP_STOPPED[@]}"; do
+		[ -n "$s" ] || continue
+		systemctl start "$s" || log_warn "Dienst $s ließ sich nicht starten."
+	done
+	_BACKUP_STOPPED=()
+}
+
+_create_stop_service() {
+	# Was nicht läuft, wird weder gestoppt noch hinterher gestartet
+	if ! systemctl is-active --quiet "$1"; then
+		log_info "Dienst $1 läuft nicht – nichts zu stoppen."
+		return 0
+	fi
+	if systemctl stop "$1"; then
+		_BACKUP_STOPPED+=("$1")
+	else
+		log_warn "Dienst $1 ließ sich nicht stoppen."
+	fi
+}
+
+create_build_meta() {
+	local work="$1" lbhome="$2" m="$1/meta" f name ver arch deb
+	local -a pats=()
+	mkdir -p "$m/apt/sources.list.d" "$m/apt/keyrings" "$m/apt/preferences.d" "$m/apt/trusted.gpg.d" "$m/apt/debs"
+
+	collect_manual_packages <(_lbb_conf_packages_exclude) > "$m/apt/manual.txt"
+	collect_holds > "$m/apt/holds.txt"
+
+	for f in "$(lbb_p /etc/apt/sources.list.d)"/*; do
+		[ -f "$f" ] || continue
+		case " $LBB_INSTALLER_SOURCES " in *" ${f##*/} "*) continue ;; esac
+		cp -a "$f" "$m/apt/sources.list.d/"
+		grep -ohiE 'signed-by[:=] *[^] ]+' "$f" | sed -E 's/^signed-by[:=] *//I' | while IFS= read -r deb; do
+			if [ -f "$(lbb_p "$deb")" ]; then
+				mkdir -p "$m/apt/keyrings$(dirname "$deb")"
+				cp -a "$(lbb_p "$deb")" "$m/apt/keyrings$deb"
+			fi
+		done
+	done
+	cp -a "$(lbb_p /etc/apt/preferences.d)"/. "$m/apt/preferences.d/" 2>/dev/null
+	for f in "$(lbb_p /etc/apt/trusted.gpg.d)"/*; do
+		[ -f "$f" ] || continue
+		if ! dpkg_owned_paths /etc/apt/trusted.gpg.d/ | grep -qxF "${f#"$LBB_ROOT"}"; then
+			cp -a "$f" "$m/apt/trusted.gpg.d/"
+		fi
+	done
+
+	mapfile -t pats < <(lbb_read_patterns <(_lbb_conf_packages_exclude))
+	: > "$m/apt/local-packages.txt"
+	collect_local_packages | while IFS=$'\t' read -r name ver arch; do
+		if lbb_match_any "$name" "${pats[@]}"; then
+			continue
+		fi
+		if deb="$(find_deb_for "$name" "$ver" "$arch" "$(lbb_p /var/cache/apt/archives)" "$(lbb_p "$lbhome")/data/system/install")"; then
+			cp -a "$deb" "$m/apt/debs/"
+			printf '%s\t%s\t%s\tgefunden\n' "$name" "$ver" "$arch" >> "$m/apt/local-packages.txt"
+		else
+			printf '%s\t%s\t%s\tfehlt\n' "$name" "$ver" "$arch" >> "$m/apt/local-packages.txt"
+		fi
+	done
+
+	collect_dietpi_software > "$m/dietpi-software.txt"
+	collect_user_groups loxberry > "$m/groups.txt"
+	collect_extra_users > "$m/users.txt"
+	( umask 077; collect_passwd_hashes > "$m/passwd-hashes.txt" )
+	collect_etc_symlinks "$lbhome" > "$m/etc-symlinks.txt"
+	printf '%s\n' "$META_HOSTNAME" > "$m/hostname"
+	cat "$(lbb_p /etc/timezone)" > "$m/timezone" 2>/dev/null
+}
+
+create_build_lists() {
+	local work="$1" lbhome="$2" rel="${2#/}" e folder path out_abs root_abs ref
+	{
+		printf '%s\n' "$rel" usr/local
+		ref="$(lbb_p "$lbhome")/packages${META_OS_VERSION_ID%%.*}.txt"
+		# Fehlt die Liste, warnt create_main (hier in der Pipeline ginge der Warnungszähler verloren)
+		if [ -r "$ref" ]; then
+			collect_var_lib_dirs "$work/meta/apt/manual.txt" "$ref"
+		fi
+		collect_optional_dirs
+		# /etc komplett (wenige MB Text); was davon nicht eingespielt wird, entscheidet der Restore
+		printf 'etc\n'
+	} | awk 'NF && !seen[$0]++' | while IFS= read -r e; do
+		if [ -e "$(lbb_p "/$e")" ] || [ -L "$(lbb_p "/$e")" ]; then
+			printf '%s\n' "$e"
+		fi
+	done > "$work/payload.list"
+
+	{
+		printf '%s\n' "$rel/log/system_tmpfs" "$rel/.cache" "$rel/.npm/_cacache" "$rel/data/system/tmp"
+		# MariaDB-Dateien nie direkt: kommen als Dump (dumps/mariadb.sql)
+		printf '%s\n' var/lib/mysql
+		# Eindeutige ID der Box: ein Clone bekommt eine eigene (apply, R10)
+		printf '%s\n' "$rel/config/system/loxberryid.cfg"
+		if [ "$LBB_NO_LOGS" = 1 ]; then
+			printf '%s\n' "$rel/log"
+		fi
+		for e in "${LBB_PLUGIN_EXCLUDES[@]}"; do
+			folder="${e%%:*}"
+			path="${e#*:}"
+			printf '%s\n' "$rel/data/plugins/$folder/$path"
+		done
+		# Liegt das Ausgabeverzeichnis in der Payload, würde das Backup sich und seine Vorgänger mitsichern
+		out_abs="$(readlink -m "$LBB_OUTPUT")"
+		root_abs="$(readlink -m "$(lbb_p /)")"
+		case "$out_abs" in
+			"$root_abs"/*) printf '%s\n' "${out_abs#"$root_abs"/}" ;;
+		esac
+	} > "$work/exclude.list"
+}
+
+create_main() {
+	local lbhome work out rc s ext logdir avail
+	lbb_require_root
+	lbhome="$(lbb_lbhomedir)"
+	[ -n "$lbhome" ] || die 2 "Kein LoxBerry gefunden (LBHOMEDIR fehlt in /etc/environment)."
+	if [ -z "$LBB_LOGFILE" ]; then
+		logdir="$(lbb_p "$lbhome")/log/system/lbclone"
+		mkdir -p "$logdir"
+		LBB_LOGFILE="$logdir/create-$(date +%Y%m%d-%H%M%S).log"
+	fi
+	[ -n "${LBB_OUTPUT:-}" ] || die 2 "--output fehlt."
+	case "$(readlink -m "$LBB_OUTPUT")/" in
+		/tmp/*) [ "${LBB_ALLOW_TMP_OUTPUT:-0}" = 1 ] || die 2 "--output darf nicht unter /tmp liegen (tmpfs)." ;;
+	esac
+	[ -d "$LBB_OUTPUT" ] && [ -w "$LBB_OUTPUT" ] || die 2 "Ausgabeverzeichnis nicht beschreibbar: $LBB_OUTPUT"
+
+	# jq, 7-Zip und ggf. gpg bei Bedarf nachinstallieren
+	case "$LBB_COMPRESS" in
+		7z|zip|gz) ;;
+		*) die 2 "--compress: '$LBB_COMPRESS' – erlaubt sind 7z, zip und gz." ;;
+	esac
+	local -a tools=(jq:jq "$(archive_tools "$LBB_COMPRESS")")
+	if [ "$LBB_PASSFILE" != "-" ]; then
+		tools+=(gpg:gpg)
+	fi
+	lbb_ensure_tools "${tools[@]}"
+
+	meta_collect_system "$lbhome"
+	meta_check_v0 || die 2 "Nicht unterstützt: Debian $META_OS_VERSION_ID / LoxBerry $META_LB_VERSION (mindestens Debian 13 und LoxBerry 4)."
+
+	work="$(mktemp -d /tmp/lbclone.XXXXXX)"
+	_LBB_WORK="$work"
+	trap '_create_restart_services; rm -rf "$_LBB_WORK" ${_LBB_STAGE:+"$_LBB_STAGE"}; [ -z "$_LBB_OUT" ] || rm -f "$_LBB_OUT"' EXIT
+	trap 'exit 3' INT TERM
+
+	create_build_meta "$work" "$lbhome"
+	if [ ! -r "$(lbb_p "$lbhome")/packages${META_OS_VERSION_ID%%.*}.txt" ]; then
+		log_warn "packages${META_OS_VERSION_ID%%.*}.txt fehlt – ohne Installer-Liste werden keine Paketdatenverzeichnisse unter /var/lib gesichert."
+	fi
+	create_build_lists "$work" "$lbhome"
+	META_PAYLOAD_BYTES="$(cd "$(lbb_p /)" && tr '\n' '\0' < "$work/payload.list" \
+		| du -sbc --files0-from=- --exclude-from="$work/exclude.list" 2>/dev/null | tail -n 1 | cut -f1)"
+	meta_write_json "$work/meta/meta.json" "$(lbb_p "$lbhome")/data/system/plugindatabase.json-"
+	meta_write_sums "$work"
+
+	log_info "Von Hand installierte Pakete: $(wc -l < "$work/meta/apt/manual.txt")"
+	log_info "Zu sichernde Pfade: $(wc -l < "$work/payload.list") Pfade, ca. $(( ${META_PAYLOAD_BYTES:-0} / 1048576 )) MB"
+	avail="$(df --output=avail -B1 "$LBB_OUTPUT" 2>/dev/null | tail -n 1 | tr -d ' ')"
+	if [[ "$avail" =~ ^[0-9]+$ ]] && [ "$avail" -lt "${META_PAYLOAD_BYTES:-0}" ]; then
+		log_warn "Wenig Platz am Ziel: $((avail / 1048576)) MB frei, Payload unkomprimiert ca. $(( ${META_PAYLOAD_BYTES:-0} / 1048576 )) MB."
+	fi
+	if [ "${LBB_DRY_RUN:-0}" = 1 ]; then
+		sed 's/^/  /' "$work/payload.list"
+		return 0
+	fi
+
+	tar -C "$work" -cf "$work/meta.tar" meta || die 3 "meta.tar ließ sich nicht erzeugen."
+
+	# Mosquitto nicht stoppen: per SIGUSR1 schreiben lassen, dann die fertige Datei kopieren (SPEC 7.3)
+	if [ -d "$(lbb_p /var/lib/mosquitto)" ]; then
+		_create_flush_mosquitto
+		mkdir -p "$work/snap/var/lib"
+		cp -a "$(lbb_p /var/lib/mosquitto)" "$work/snap/var/lib/"
+		# Nur das Verzeichnis selbst ins Archiv, nicht var/ und var/lib/ (deren Rechte kämen sonst mit)
+		printf 'var/lib/mosquitto\n' > "$work/snap.list"
+	fi
+	_LBB_STAGE="$(mktemp -d "$LBB_OUTPUT/.lbclone-stage.XXXXXX")"
+	_create_dump_mariadb "$_LBB_STAGE"
+	for s in "${LBB_STOP_SERVICES[@]}"; do
+		_create_stop_service "$s"
+	done
+
+	ext="$(archive_ext "$LBB_COMPRESS")"
+	out="$LBB_OUTPUT/lbclone-${META_HOSTNAME}-${META_LB_VERSION}-$(date +%Y%m%d-%H%M%S).$ext"
+	log_info "Schreibe $out"
+	_LBB_OUT="$out"
+	archive_create "$out" "$work" "$LBB_COMPRESS" "$LBB_PASSFILE" "$work/exclude.list" "$work/payload.list" "$_LBB_STAGE"
+	rc=$?
+	_create_restart_services
+	rm -rf "$_LBB_STAGE"
+	_LBB_STAGE=""
+	case "$rc" in
+		0) ;;
+		1) log_warn "Dateien haben sich während des Backups geändert." ;;
+		*) rm -f "$out"; die 3 "Archiv konnte nicht geschrieben werden." ;;
+	esac
+	if [ -s "$work/tar-warnings.txt" ]; then
+		log_warn "tar meldete $(wc -l < "$work/tar-warnings.txt") Problem(e), z. B. nicht lesbare Dateien:"
+		head -n 20 "$work/tar-warnings.txt" | while IFS= read -r s; do log_warn "  $s"; done
+	fi
+	chmod 600 "$out"
+	archive_verify "$out" "$LBB_PASSFILE" "$work/verify" || die 3 "Prüfung des Archivs fehlgeschlagen: $out"
+	_LBB_OUT=""
+	log_ok "Backup fertig: $out ($(du -h "$out" | cut -f1))"
+	log_info "Einspielen auf einem frischen DietPi: Archiv entpacken (7z x …, auch unter Windows möglich), im entpackten Ordner als root: bash lbclone apply"
+	case "$LBB_OUTPUT" in
+		/mnt/*|/media/*)
+			if [ "$LBB_PASSFILE" = "-" ]; then
+				log_warn "Backup liegt auf einem Netz- oder Wechsellaufwerk und ist unverschlüsselt; es enthält Zugangsdaten. Empfehlung: --encrypt."
+			fi
+			;;
+	esac
+}
+
+# Gemeinsame Vorbereitung für info und verify: Werkzeuge und Arbeitsordner (setzt _LBB_WORK)
+_readonly_prepare() {
+	lbb_ensure_tools jq:jq "$(archive_tools "$LBB_INPUT")"
+	if archive_is_encrypted "$LBB_INPUT"; then
+		archive_require_pass "$LBB_INPUT" "$LBB_PASSFILE"
+		lbb_ensure_tools gpg:gpg
+	fi
+	_LBB_WORK="$(mktemp -d "/tmp/lbclone-$1.XXXXXX")"
+	trap 'rm -rf "$_LBB_WORK"' EXIT
+}
+
+info_main() {
+	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
+	_readonly_prepare info
+	archive_read_meta "$LBB_INPUT" "$LBB_PASSFILE" "$_LBB_WORK" || die 3 "Manifest nicht lesbar."
+	meta_read_json "$_LBB_WORK/meta/meta.json"
+	printf 'Box:         %s\n' "$META_HOSTNAME"
+	printf 'System:      %s %s (%s), %s\n' "$META_OS_ID" "$META_OS_VERSION_ID" "$META_OS_CODENAME" "$META_ARCH"
+	printf 'LoxBerry:    %s in %s\n' "$META_LB_VERSION" "$META_LB_HOMEDIR"
+	printf 'Payload:     ca. %s MB\n' "$(( ${META_PAYLOAD_BYTES:-0} / 1048576 ))"
+	printf 'Installer:   %s -t %s\n' "$(installer_script_name "$META_OS_CODENAME" "$META_LB_VERSION")" "$META_LB_VERSION"
+	printf 'Plugins:\n'
+	plugins_decide --meta "$_LBB_WORK/meta/meta.json" | awk -F'\t' '{printf "  %-24s %-12s autoupdate=%s  %s %s\n", $2, $4, $5, $6, $7}'
+}
+
+verify_main() {
+	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
+	_readonly_prepare verify
+	archive_verify "$LBB_INPUT" "$LBB_PASSFILE" "$_LBB_WORK" || die 3 "Archiv beschädigt oder Prüfsummen falsch: $LBB_INPUT"
+	log_ok "Archiv in Ordnung: $LBB_INPUT"
+}
+
+# ============================================================ apply
+
+# Ablauf "lbclone apply" (SPEC 3, 6).
+
+: "${LBB_STATE_DIR:=/var/lib/lbclone}"
+
+_apply_state() {
+	lbb_p "$LBB_STATE_DIR"
+}
+
+_apply_os_release() {
+	sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$(lbb_p /etc/os-release)" 2>/dev/null | head -n 1
+}
+
+apply_precheck() {
+	local st lbhome have_ver avail path
+	lbb_require_root
+	if [ -n "${LBB_NEW_HOSTNAME:-}" ] && ! [[ "$LBB_NEW_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+		die 2 "--hostname: '$LBB_NEW_HOSTNAME' ist kein gültiger Hostname (Buchstaben, Ziffern, Bindestrich, max. 63 Zeichen)."
+	fi
+	[ -r "$LBB_INPUT" ] || die 2 "Clone nicht lesbar: $LBB_INPUT"
+	# Für ein --resume nach einem Abbruch muss das Werkzeug Installer und Neustart überleben
+	path="${LBB_SELF_CHECK_PATH:-$LBB_SELF}"
+	case "$path" in
+		/opt/*|/tmp/*) die 2 "lbclone liegt unter $path – der Installer löscht LBHOMEDIR, der Neustart leert /tmp. Den Clone z. B. nach /root entpacken." ;;
+	esac
+	# jq für das Manifest, 7-Zip bzw. gzip für das Archiv, gpg bei Verschlüsselung
+	lbb_ensure_tools jq:jq "$(archive_tools "$LBB_INPUT")"
+	if archive_is_encrypted "$LBB_INPUT"; then
+		archive_require_pass "$LBB_INPUT" "$LBB_PASSFILE"
+		lbb_ensure_tools gpg:gpg
+	fi
+	st="$(_apply_state)"
+	rm -rf "$st/meta"
+	mkdir -p "$st"
+	chmod 700 "$st"
+	log_debug "Clone: $LBB_INPUT"
+	archive_read_meta "$LBB_INPUT" "$LBB_PASSFILE" "$st" || die 2 "Manifest nicht lesbar (Passphrase?)."
+	meta_check_sums "$st" || die 2 "Prüfsummen des Manifests stimmen nicht."
+	meta_read_json "$st/meta/meta.json"
+	log_debug "Manifest: $META_HOSTNAME, $META_OS_ID $META_OS_VERSION_ID ($META_OS_CODENAME), $META_ARCH, LoxBerry $META_LB_VERSION"
+
+	meta_check_v0 || die 2 "Backup von Debian $META_OS_VERSION_ID / LoxBerry $META_LB_VERSION wird nicht unterstützt."
+	if [ "$(_apply_os_release ID)" != "$META_OS_ID" ] ||
+		[ "$(_apply_os_release VERSION_ID)" != "$META_OS_VERSION_ID" ] ||
+		[ "$(_apply_os_release VERSION_CODENAME)" != "$META_OS_CODENAME" ]; then
+		die 2 "Betriebssystem passt nicht (Backup: $META_OS_ID $META_OS_VERSION_ID $META_OS_CODENAME)."
+	fi
+	if [ -n "${META_DEBIAN_VERSION:-}" ] && [ "$(cat "$(lbb_p /etc/debian_version)" 2>/dev/null)" != "$META_DEBIAN_VERSION" ]; then
+		log_warn "Debian-Subversion weicht ab (Backup $META_DEBIAN_VERSION, hier $(cat "$(lbb_p /etc/debian_version)" 2>/dev/null))."
+	fi
+	[ "$(dpkg --print-architecture)" = "$META_ARCH" ] || die 2 "Architektur passt nicht (Backup: $META_ARCH)."
+	[ -e "$(lbb_p /boot/dietpi/.version)" ] || die 2 "Kein DietPi gefunden."
+
+	if [ "${LBB_ALLOW_CORE_MISMATCH:-0}" = 1 ] && [ "${LBB_SKIP_INSTALL:-0}" != 1 ]; then
+		die 2 "--allow-core-mismatch gilt nur zusammen mit --skip-install."
+	fi
+	lbhome="$(lbb_lbhomedir)"
+	if [ "${LBB_SKIP_INSTALL:-0}" != 1 ]; then
+		# Sperrdatei, die der Installer nach erfolgreicher Installation anlegt (install_trixie_v4.sh:28).
+		# Der Pfad ist ein Fakt über den Installer; zweiteilig, damit die Pfadprüfung nicht anschlägt.
+		if [ -n "$lbhome" ] || [ -e "$(lbb_p "/opt/lox""berry/config/system/do_lbupdate")" ]; then
+			die 2 "Es ist bereits ein LoxBerry installiert. Restore braucht ein frisches DietPi (oder --skip-install)."
+		fi
+	else
+		[ -n "$lbhome" ] || die 2 "--skip-install, aber kein LoxBerry installiert."
+		[ "$lbhome" = "$META_LB_HOMEDIR" ] || die 2 "LBHOMEDIR $lbhome weicht vom Backup ab ($META_LB_HOMEDIR)."
+		have_ver="$(jq -r '.Base.Version // empty' "$(lbb_p "$lbhome")/config/system/general.json" 2>/dev/null)"
+		if [ "$have_ver" != "$META_LB_VERSION" ] && [ "${LBB_ALLOW_CORE_MISMATCH:-0}" != 1 ]; then
+			die 2 "Installiert ist LoxBerry $have_ver, das Backup stammt von $META_LB_VERSION."
+		fi
+	fi
+
+	avail="$(df --output=avail -B1 "$(lbb_p /)" | tail -n 1 | tr -d ' ')"
+	[ "$avail" -gt "$(( ${META_PAYLOAD_BYTES:-0} * 2 ))" ] || die 2 "Zu wenig Platz ($avail Bytes frei, Backup ca. $META_PAYLOAD_BYTES)."
+
+
+	# Clone einmal unverschlüsselt ins Zustandsverzeichnis (Platte): danach braucht der Restore
+	# weder 7-Zip noch die Passphrase, und es ist egal, wo das Archiv lag
+	if [ "${LBB_DRY_RUN:-0}" != 1 ]; then
+		case "$(readlink -m "$LBB_INPUT")" in
+			/opt/*|/tmp/*) path=volatil ;;
+			*) path=dauerhaft ;;
+		esac
+		if archive_is_encrypted "$LBB_INPUT" || [ "$(archive_tools "$LBB_INPUT")" != tar:tar ] || [ "$path" = volatil ]; then
+			log_info "Lege $LBB_INNER nach $st"
+			( umask 077; archive_stream "$LBB_INPUT" "$LBB_PASSFILE" > "$st/$LBB_INNER" ) || die 2 "Clone ließ sich nicht auspacken (Passphrase?)."
+			LBB_INPUT="$st/$LBB_INNER"
+			LBB_PASSFILE="-"
+		fi
+	fi
+
+	LBB_INSTALLER_SCRIPT="$(installer_script_name "$META_OS_CODENAME" "$META_LB_VERSION")"
+	if [ "${LBB_SKIP_INSTALL:-0}" != 1 ]; then
+		installer_available "$LBB_INSTALLER_SCRIPT" || die 2 "Installer-Skript $LBB_INSTALLER_SCRIPT nicht gefunden ($(installer_url "$LBB_INSTALLER_SCRIPT"))."
+		installer_release_exists "$META_LB_VERSION" || die 2 "LoxBerry-Release $META_LB_VERSION auf GitHub nicht gefunden."
+	fi
+	log_ok "Vorprüfung bestanden: $META_HOSTNAME, LoxBerry $META_LB_VERSION, Installer $LBB_INSTALLER_SCRIPT"
+}
+
+LBB_APPLY_STEPS="R2 R4 R5 R6 R7 R8 R9 R10 R11 R11B R11C R12 R13"
+
+_state_file() {
+	printf '%s/apply.state' "$(_apply_state)"
+}
+
+# Zustand als Zeilen "SCHLÜSSEL<TAB>wert"
+state_set() {
+	local f
+	f="$(_state_file)"
+	(
+		umask 077
+		mkdir -p "$(dirname "$f")"
+		chmod 700 "$(dirname "$f")"
+		touch "$f"
+		grep -v "^$1"$'\t' "$f" > "$f.new" || true
+		printf '%s\t%s\n' "$1" "$2" >> "$f.new"
+		mv "$f.new" "$f"
+	)
+}
+
+state_get() {
+	local f
+	f="$(_state_file)"
+	[ -r "$f" ] || return 0
+	grep "^$1"$'\t' "$f" | tail -n 1 | cut -f2-
+}
+
+state_done() {
+	state_set "DONE_$1" 1
+}
+
+state_is_done() {
+	[ "$(state_get "DONE_$1")" = 1 ]
+}
+
+_apply_step_skipped() {
+	case "$1" in
+		R2) [ "$(state_get SKIP_INSTALL)" = 1 ] ;;
+		R11C) [ "$(state_get UPDATE_CORE)" != 1 ] ;;
+		*) return 1 ;;
+	esac
+}
+
+# Was ein Schritt tut, in Worten für den Anwender (die Kürzel bleiben intern im Zustand)
+_apply_step_title() {
+	case "$1" in
+		R2)   printf 'LoxBerry mit dem Installer installieren (dauert lange, auf einem Raspberry bis zu einer Stunde)' ;;
+		R4)   printf 'LoxBerry-Dienste anhalten (loxberry, apache2, mosquitto, cron)' ;;
+		R5)   printf 'Paketquellen aus dem Clone übernehmen und Paketlisten aktualisieren' ;;
+		R6)   printf 'Fehlende DietPi-Software nachinstallieren' ;;
+		R7)   printf 'Pakete der Quellbox installieren (je nach Umfang länger)' ;;
+		R8)   printf 'Benutzer, Gruppen und Passwörter übernehmen' ;;
+		R9)   printf 'Dateien aus dem Clone zurückspielen (/etc, LoxBerry mit Plugins und Daten, /usr/local, /var)' ;;
+		R10)  printf 'System anpassen: Hostname, neue LoxBerry-ID, Zeitzone, MQTT-Passwörter, Dateirechte' ;;
+		R11)  printf 'Dienste wieder starten' ;;
+		R11B) printf 'MariaDB-Datenbanken einspielen' ;;
+		R11C) printf 'LoxBerry auf das neueste Release aktualisieren' ;;
+		R12)  printf 'Plugins neu installieren' ;;
+		R13)  printf 'Abschluss: Bericht ausgeben, Log ablegen, aufräumen' ;;
+		*)    printf '%s' "$1" ;;
+	esac
+}
+
+# Arbeitsverzeichnis der Schritte: das Home von loxberry. Programme, die per "sudo -u loxberry"
+# laufen (z. B. find in plugininstall.pl:1806), scheitern in einem Verzeichnis, das loxberry nicht
+# betreten darf (/root). Vor und während der Installation gibt es das Home noch nicht bzw. der
+# Installer löscht es (install_trixie_v4.sh:245) – dann /.
+_apply_workdir() {
+	local home
+	home="$(getent passwd loxberry 2>/dev/null | cut -d: -f6)"
+	if [ -n "$home" ] && [ -d "$(lbb_p "$home")" ]; then
+		lbb_p "$home"
+	else
+		lbb_p /
+	fi
+}
+
+apply_run_steps() {
+	local s n=0 total=0
+	for s in $LBB_APPLY_STEPS; do
+		_apply_step_skipped "$s" || total=$((total + 1))
+	done
+	for s in $LBB_APPLY_STEPS; do
+		_apply_step_skipped "$s" || n=$((n + 1))
+		state_is_done "$s" && continue
+		if _apply_step_skipped "$s"; then
+			state_done "$s"
+			continue
+		fi
+		log_info "Schritt $n von $total: $(_apply_step_title "$s")"
+		cd "$(_apply_workdir)" || cd / || return 3
+		if ! "apply_step_$s"; then
+			log_err "Fehlgeschlagen: $(_apply_step_title "$s"). Details im Log ${LBB_LOGFILE:-}; nach der Behebung fortsetzen mit: bash lbclone apply --resume"
+			return 3
+		fi
+		state_done "$s"
+	done
+	return 0
+}
+
+_apply_save_options() {
+	state_set INPUT "$(readlink -m "$LBB_INPUT")"
+	state_set VERBOSE "${LBB_VERBOSE:-0}"
+	state_set SKIP_INSTALL "${LBB_SKIP_INSTALL:-0}"
+	state_set ALLOW_CORE_MISMATCH "${LBB_ALLOW_CORE_MISMATCH:-0}"
+	state_set FORCE_PLUGIN_REINSTALL "${LBB_FORCE_PLUGIN_REINSTALL:-0}"
+	state_set NO_PLUGIN_REINSTALL "${LBB_NO_PLUGIN_REINSTALL:-0}"
+	state_set SKIP_PLUGINS "${LBB_SKIP_PLUGINS[*]}"
+	state_set GITHUB_AUTH "${LBB_GITHUB_AUTH:-}"
+	state_set NO_REBOOT "${LBB_NO_REBOOT:-0}"
+	state_set INSTALLER_SCRIPT "$LBB_INSTALLER_SCRIPT"
+	state_set NEW_HOSTNAME "${LBB_NEW_HOSTNAME:-}"
+	state_set NEW_LBNAME "${LBB_NEW_LBNAME:-}"
+	state_set UPDATE_CORE "${LBB_UPDATE_CORE:-0}"
+}
+
+_apply_load_options() {
+	LBB_INPUT="$(state_get INPUT)"
+	LBB_VERBOSE="$(state_get VERBOSE)"
+	LBB_SKIP_INSTALL="$(state_get SKIP_INSTALL)"
+	LBB_ALLOW_CORE_MISMATCH="$(state_get ALLOW_CORE_MISMATCH)"
+	LBB_FORCE_PLUGIN_REINSTALL="$(state_get FORCE_PLUGIN_REINSTALL)"
+	LBB_NO_PLUGIN_REINSTALL="$(state_get NO_PLUGIN_REINSTALL)"
+	read -r -a LBB_SKIP_PLUGINS <<< "$(state_get SKIP_PLUGINS)"
+	LBB_GITHUB_AUTH="$(state_get GITHUB_AUTH)"
+	LBB_NO_REBOOT="$(state_get NO_REBOOT)"
+	LBB_INSTALLER_SCRIPT="$(state_get INSTALLER_SCRIPT)"
+	meta_read_json "$(_apply_state)/meta/meta.json"
+}
+
+_apply_console() {
+	printf '%s/console.log' "$(_apply_state)"
+}
+
+# Ausgabe des Hintergrundprozesses anzeigen, bis er endet: _apply_follow <pid> <tail-zeilen> [eigenes-kind]
+# Strg+C beendet nur die Anzeige. Beim eigenen Kind kommt dessen Exitcode zurück.
+_apply_follow() {
+	local pid="$1" lines="$2" own="${3:-0}" tailpid rc=0
+	tail -n "$lines" -F --pid="$pid" "$(_apply_console)" 2>/dev/null &
+	tailpid=$!
+	trap 'kill "$tailpid" 2>/dev/null; printf "\n"; log_info "Anzeige beendet – der Restore läuft im Hintergrund weiter. Fortschritt wieder anzeigen: bash lbclone apply"; exit 0' INT
+	if [ "$own" = 1 ]; then
+		wait "$pid"
+		rc=$?
+	fi
+	wait "$tailpid"
+	trap - INT
+	return "$rc"
+}
+
+# Restore vom Terminal lösen: eigener Prozess in eigener Session (kein SIGHUP beim Abriss der
+# SSH-Verbindung), Ausgabe in console.log, die hier mitgelesen wird
+_apply_detach() {
+	local console pid
+	console="$(_apply_console)"
+	( umask 077; : > "$console" )
+	# Sperre an den Hintergrundprozess abgeben
+	exec 9>&-
+	LBB_DETACHED=1 setsid -w bash "$LBB_SELF" apply --resume < /dev/null >> "$console" 2>&1 &
+	pid=$!
+	log_info "Der Restore läuft im Hintergrund und läuft weiter, auch wenn die Verbindung abreißt. Fortschritt wieder anzeigen: nach dem Einloggen erneut 'bash lbclone apply'. Strg+C beendet nur die Anzeige."
+	_apply_follow "$pid" +1 1
+}
+
+apply_main() {
+	local rc pid
+	lbb_require_root
+	mkdir -p "$(lbb_p /var/log/lbclone)" "$(_apply_state)"
+	chmod 700 "$(_apply_state)"
+	LBB_LOGFILE="${LBB_LOGFILE:-$(lbb_p /var/log/lbclone)/apply.log}"
+	LBB_WARNFILE="$(_apply_state)/warnings.txt"
+	# Nur ein Restore gleichzeitig
+	exec 9> "$(_apply_state)/apply.lock"
+	if ! flock -n 9; then
+		pid="$(cat "$(_apply_state)/apply.pid" 2>/dev/null)"
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			log_info "Ein Restore läuft bereits – zeige seinen Fortschritt. Strg+C beendet nur die Anzeige."
+			_apply_follow "$pid" 30
+			return 0
+		fi
+		die 2 "Ein Restore läuft bereits (Log: $LBB_LOGFILE)."
+	fi
+	if [ "${LBB_RESUME:-0}" = 1 ]; then
+		[ -r "$(_state_file)" ] || die 2 "Kein Restore-Zustand gefunden."
+		if [ "${LBB_DETACHED:-0}" != 1 ]; then
+			_apply_detach
+			rc=$?
+			[ "$rc" = 0 ] || exit "$rc"
+			return 0
+		fi
+		trap '' HUP
+		echo "$$" > "$(_apply_state)/apply.pid"
+		_apply_load_options
+		apply_run_steps
+		rc=$?
+		[ "$rc" = 0 ] || exit "$rc"
+		return 0
+	fi
+	if [ -r "$(_state_file)" ]; then
+		die 2 "Es gibt bereits einen Restore-Zustand ($(_state_file)). Fortsetzen mit 'lbclone apply --resume' oder Datei nach Prüfung entfernen."
+	fi
+	[ -n "${LBB_INPUT:-}" ] || die 2 "--input fehlt."
+	# Bricht die Vorprüfung ab, keine Meta-Daten (u. a. Passwort-Hashes) liegen lassen
+	trap '[ -e "$(_state_file)" ] || rm -rf "$(_apply_state)/meta" "$(_apply_state)/$LBB_INNER"' EXIT
+	apply_precheck
+	if [ "${LBB_DRY_RUN:-0}" = 1 ]; then
+		printf 'Installer: %s -t %s\n' "$LBB_INSTALLER_SCRIPT" "$META_LB_VERSION"
+		# Vor der Installation fehlen die LoxBerry-Perl-Libs; dann nur Hinweis
+		plugins_decide --meta "$(_apply_state)/meta/meta.json" 2>/dev/null ||
+			log_warn "Plugin-Plan erst nach der Installation verfügbar; 'lbclone info' auf einem LoxBerry zeigt ihn vorab."
+		rm -rf "$(_apply_state)/meta" "$(_apply_state)/$LBB_INNER"
+		return 0
+	fi
+	_apply_save_options
+	_apply_detach
+	rc=$?
+	[ "$rc" = 0 ] || exit "$rc"
+	return 0
+}
+
+apply_step_R2() {
+	local rc
+	LBB_GITHUB_AUTH="$(state_get GITHUB_AUTH)"
+	log_info "Installiere LoxBerry $META_LB_VERSION mit $LBB_INSTALLER_SCRIPT (Commit $(installer_commit "$LBB_INSTALLER_SCRIPT"))"
+	installer_run "$LBB_INSTALLER_SCRIPT" "$META_LB_VERSION" "$(_apply_state)/installer" 2>&1 | lbb_output_always
+	rc="${PIPESTATUS[0]}"
+	if [ "$rc" != 0 ]; then
+		log_err "Installer endete mit Exitcode $rc (Log: $LBB_LOGFILE)."
+		return 1
+	fi
+	installer_verify "$META_LB_VERSION" "$META_LB_HOMEDIR" || return 1
+	# Der Installer legt do_lbupdate an (install_trixie_v4.sh:978); beim nächsten Boot würde
+	# 03-loxberryupdate dann aufs neueste Release aktualisieren – vor dem Einspielen des Clones.
+	rm -f "$(lbb_p "$META_LB_HOMEDIR")/config/system/do_lbupdate"
+	log_ok "LoxBerry $META_LB_VERSION installiert (automatisches Core-Update beim ersten Boot unterbunden)."
+}
+
+: "${LBB_DIETPI_SOFTWARE:=/boot/dietpi/dietpi-software}"
+
+_apply_meta() {
+	printf '%s/meta' "$(_apply_state)"
+}
+
+# Liest /etc/environment in die Umgebung (LoxBerry-Skripte brauchen LBHOMEDIR, PERL5LIB …)
+apply_env_load() {
+	local env
+	env="$(lbb_p /etc/environment)"
+	[ -r "$env" ] || return 0
+	set -a
+	# shellcheck disable=SC1090
+	. "$env"
+	set +a
+}
+
+# Mitgesicherte Schlüssel der Paketquellen einzeln zurück (cp -a <dir>/. würde Rechte von /, /etc … überschreiben)
+_apply_restore_keyrings() {
+	local k f
+	k="$(_apply_meta)/apt/keyrings"
+	[ -d "$k" ] || return 0
+	( cd "$k" && find . -type f ) | while IFS= read -r f; do
+		f="${f#./}"
+		mkdir -p "$(dirname "$(lbb_p "/$f")")"
+		cp -a "$k/$f" "$(lbb_p "/$f")"
+	done
+}
+
+apply_step_R4() {
+	systemctl stop loxberry apache2 mosquitto cron || log_warn "Nicht alle Dienste ließen sich stoppen."
+	return 0
+}
+
+apply_step_R5() {
+	local m f
+	m="$(_apply_meta)/apt"
+	mkdir -p "$(lbb_p /etc/apt/sources.list.d)" "$(lbb_p /etc/apt/preferences.d)" "$(lbb_p /etc/apt/trusted.gpg.d)"
+	cp -a "$m/sources.list.d/." "$(lbb_p /etc/apt/sources.list.d)/"
+	_apply_restore_keyrings
+	cp -a "$m/preferences.d/." "$(lbb_p /etc/apt/preferences.d)/"
+	cp -a "$m/trusted.gpg.d/." "$(lbb_p /etc/apt/trusted.gpg.d)/"
+	apt-get update 2>&1 | lbb_output_always
+	[ "${PIPESTATUS[0]}" = 0 ] || return 1
+}
+
+# Laufende Dienste (für den Vergleich vor/nach der Paketinstallation)
+_apply_active_services() {
+	systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' | sort -u
+}
+
+apply_step_R6() {
+	local have want
+	local -a missing=()
+	# Vor DietPi-Software und Paketen festhalten, was schon läuft; R9 stoppt nur, was danach dazukam
+	if [ ! -e "$(_apply_state)/services-before.txt" ]; then
+		_apply_active_services > "$(_apply_state)/services-before.txt"
+	fi
+	have="$(collect_dietpi_software)"
+	while IFS= read -r want; do
+		[ -n "$want" ] || continue
+		grep -qx "$want" <<< "$have" || missing+=("$want")
+	done < "$(_apply_meta)/dietpi-software.txt"
+	[ "${#missing[@]}" -eq 0 ] && return 0
+	"$LBB_DIETPI_SOFTWARE" install "${missing[@]}" || log_warn "DietPi-Software ${missing[*]} nicht vollständig installiert."
+	return 0
+}
+
+apply_step_R7() {
+	local m pkg deb
+	local -a ok=()
+	local avail
+	m="$(_apply_meta)/apt"
+	log_info "Prüfe, welche der $(grep -c . "$m/manual.txt") Pakete in den Paketquellen verfügbar sind"
+	# Ein Aufruf für alle Namen statt apt-cache show je Paket (bei über tausend Paketen minutenlang)
+	avail="$(_apply_state)/pkgnames.txt"
+	apt-cache pkgnames 2>/dev/null | sort -u > "$avail"
+	while IFS= read -r pkg; do
+		[ -n "$pkg" ] || continue
+		if grep -qxF "${pkg%%:*}" "$avail"; then
+			ok+=("$pkg")
+		else
+			log_warn "Paket $pkg ist in keiner Quelle verfügbar."
+		fi
+	done < "$m/manual.txt"
+	rm -f "$avail"
+	if [ "${#ok[@]}" -gt 0 ]; then
+		log_info "Installiere ${#ok[@]} Pakete"
+		if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${ok[@]}" 2>&1 | lbb_output_always ||
+			[ "${PIPESTATUS[0]}" != 0 ]; then
+			log_warn "Gemeinsame Installation fehlgeschlagen, installiere einzeln."
+			for pkg in "${ok[@]}"; do
+				DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg" 2>&1 | lbb_output_always
+				[ "${PIPESTATUS[0]}" = 0 ] || log_warn "Paket $pkg ließ sich nicht installieren."
+			done
+		fi
+	fi
+	for deb in "$m/debs"/*.deb; do
+		[ -e "$deb" ] || continue
+		dpkg -i "$deb" 2>&1 | lbb_output_always
+		[ "${PIPESTATUS[0]}" = 0 ] || log_warn "Lokales Paket ${deb##*/} ließ sich nicht installieren."
+	done
+	DEBIAN_FRONTEND=noninteractive apt-get install -y -f 2>&1 | lbb_output_always
+	[ "${PIPESTATUS[0]}" = 0 ] || log_warn "apt-get -f install meldete Fehler."
+	while IFS= read -r pkg; do
+		if [ -n "$pkg" ]; then
+			apt-mark hold "$pkg" || log_warn "Hold für $pkg nicht gesetzt."
+		fi
+	done < "$m/holds.txt"
+	if [ -r "$m/local-packages.txt" ]; then
+		awk -F'\t' '$4 == "fehlt" {print $1 " " $2}' "$m/local-packages.txt" | while IFS= read -r pkg; do
+			log_warn "Lokales Paket ohne .deb im Backup: $pkg"
+		done
+	fi
+	return 0
+}
+
+apply_step_R8() {
+	local m name uid home shell groups g hash user
+	m="$(_apply_meta)"
+	while IFS=: read -r name uid home shell groups; do
+		[ -n "$name" ] || continue
+		if getent passwd "$name" > /dev/null; then
+			continue
+		fi
+		if getent passwd "$uid" > /dev/null; then
+			useradd -m -d "$home" -s "$shell" "$name" || log_warn "Benutzer $name nicht angelegt."
+		else
+			useradd -m -d "$home" -s "$shell" -u "$uid" "$name" || log_warn "Benutzer $name nicht angelegt."
+		fi
+		for g in ${groups//,/ }; do
+			[ "$g" = "$name" ] && continue
+			if getent group "$g" > /dev/null; then
+				usermod -a -G "$g" "$name"
+			fi
+		done
+	done < "$m/users.txt"
+	while IFS= read -r g; do
+		[ -n "$g" ] && [ "$g" != loxberry ] || continue
+		if getent group "$g" > /dev/null; then
+			usermod -a -G "$g" loxberry || log_warn "loxberry nicht in Gruppe $g aufgenommen."
+		else
+			log_warn "Gruppe $g existiert nicht; loxberry bleibt ohne sie."
+		fi
+	done < "$m/groups.txt"
+	while IFS=: read -r user hash; do
+		if [ -n "$user" ] && [ -n "$hash" ]; then
+			usermod -p "$hash" "$user" || log_warn "Passwort für $user nicht gesetzt."
+		fi
+	done < "$m/passwd-hashes.txt"
+	return 0
+}
+
+# Dienste, die erst durch DietPi-Software und Pakete (R6/R7) laufen – deren Daten spielt R9 zurück
+_apply_new_services() {
+	local before
+	before="$(_apply_state)/services-before.txt"
+	[ -r "$before" ] || return 0
+	comm -13 "$before" <(_apply_active_services)
+}
+
+apply_step_R9() {
+	local input lbrel list
+	local -a svcs=()
+	input="$(state_get INPUT)"
+	mapfile -t svcs < <(_apply_new_services)
+	state_set STOPPED_SERVICES "${svcs[*]}"
+	if [ "${#svcs[@]}" -gt 0 ]; then
+		log_info "Halte neu installierte Dienste an, bevor ihre Daten zurückkommen: ${svcs[*]}"
+		systemctl stop "${svcs[@]}" 2>&1 | lbb_output
+	fi
+	# /etc ohne die Teile, die zur neuen Box gehören (SPEC 5.6); Symlinks nach LBHOMEDIR hat der
+	# Installer angelegt, ein Symlink über ein vorhandenes Verzeichnis scheitert sonst
+	list="$(_apply_state)/etc-exclude.list"
+	{
+		lbb_read_patterns <(_lbb_conf_etc_restore_exclude)
+		cut -f1 "$(_apply_meta)/etc-symlinks.txt" 2>/dev/null | sed 's|^/||'
+	} > "$list"
+	# Datenbank-Dumps ins Zustandsverzeichnis statt nach /dumps
+	local -a common=(--anchored --exclude-from="$list" --transform="s,^dumps$,${LBB_STATE_DIR#/}/dumps,;s,^dumps/,${LBB_STATE_DIR#/}/dumps/,")
+	if [ "$(state_get ALLOW_CORE_MISMATCH)" = 1 ]; then
+		lbrel="${META_LB_HOMEDIR#/}"
+		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" --exclude="$lbrel" || return 1
+		_apply_extract_userdata_only "$input" "$lbrel" || return 1
+	else
+		archive_extract "$input" - "$(lbb_p /)" "${common[@]}" || return 1
+	fi
+	rm -f "$list"
+	log_ok "Dateien zurückgespielt."
+}
+
+# Nur die Pfade, die ein Core-Update nicht anfasst (config/system/update-exclude.system)
+_apply_extract_userdata_only() {
+	local input="$1" lbrel="$2" line re excl listing
+	local -a members=()
+	excl="$(lbb_p "/$lbrel")/config/system/update-exclude.system"
+	if [ ! -r "$excl" ]; then
+		log_err "Keine Exclude-Liste des Core-Updates gefunden ($excl) – ohne sie würde der alte Core zurückgespielt."
+		return 1
+	fi
+	listing="$(_apply_state)/archive.list"
+	archive_stream "$input" - | tar -t -f - > "$listing" || return 1
+	while IFS= read -r line; do
+		line="${line%%#*}"
+		line="${line%/}"
+		case "$line" in
+			/*) ;;
+			*) continue ;;
+		esac
+		# Nur Einträge, die im Backup vorkommen – sonst bricht tar mit "Not found in archive" ab
+		re="$(printf '%s' "$lbrel$line" | sed -e 's/[].[\^$+(){}|]/\\&/g' -e 's/\*/.*/g' -e 's/?/./g')"
+		if grep -qE "^${re}(/|$)" "$listing"; then
+			members+=("$lbrel$line")
+		fi
+	done < "$excl"
+	rm -f "$listing"
+	if [ "${#members[@]}" -eq 0 ]; then
+		log_err "Keine Nutzdaten-Pfade im Backup gefunden – breche ab, statt den alten Core zurückzuspielen."
+		return 1
+	fi
+	log_warn "--allow-core-mismatch: nur Konfiguration und Daten aus dem Backup (ungeprüfter Weg)."
+	archive_extract "$input" - "$(lbb_p /)" --wildcards "${members[@]}"
+}
+
+# Neue SSH- und Dropbear-Host-Keys, nur für vorhandene Schlüssel
+_apply_new_host_keys() {
+	local f t found=0
+	for f in "$(lbb_p /etc/ssh)"/ssh_host_*; do
+		[ -e "$f" ] || continue
+		rm -f "$f"
+		found=1
+	done
+	if [ "$found" = 1 ]; then
+		ssh-keygen -A > /dev/null || log_warn "Neue SSH-Host-Keys ließen sich nicht erzeugen."
+	fi
+	for t in rsa ecdsa ed25519; do
+		f="$(lbb_p /etc/dropbear)/dropbear_${t}_host_key"
+		[ -e "$f" ] || continue
+		rm -f "$f"
+		dropbearkey -t "$t" -f "$f" > /dev/null 2>&1 || log_warn "Neuer Dropbear-Host-Key ($t) ließ sich nicht erzeugen."
+	done
+	log_ok "Neue Host-Keys erzeugt (neuer Hostname)."
+}
+
+# LoxBerry-Name (general.json → Network.Friendlyname); Eigentümer und Rechte der Datei bleiben
+_apply_set_lbname() {
+	local gj tmp
+	gj="$(lbb_p "$1")/config/system/general.json"
+	tmp="$gj.lbclone"
+	if jq --arg n "$2" '.Network.Friendlyname = $n' "$gj" > "$tmp"; then
+		cat "$tmp" > "$gj"
+		log_ok "LoxBerry-Name gesetzt: $2"
+	else
+		log_warn "LoxBerry-Name ließ sich nicht setzen."
+	fi
+	rm -f "$tmp"
+}
+
+# Neue loxberryid wie setloxberryid.pl: 128 Zeichen aus A–Z, a–z, 0–9
+_apply_new_loxberryid() {
+	local f
+	f="$(lbb_p "$1")/config/system/loxberryid.cfg"
+	[ -e "$f" ] && return 0
+	( umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 128 > "$f" )
+	if [ "$EUID" -eq 0 ]; then
+		chown loxberry:loxberry "$f"
+	fi
+	log_ok "Neue loxberryid angelegt."
+}
+
+apply_step_R10() {
+	local m lbhome link target tz host lbname
+	m="$(_apply_meta)"
+	lbhome="$META_LB_HOMEDIR"
+	apply_env_load
+	while IFS=$'\t' read -r link target; do
+		[ -n "$link" ] || continue
+		mkdir -p "$(dirname "$(lbb_p "$link")")"
+		rm -rf "$(lbb_p "$link")"
+		ln -sfn "$target" "$(lbb_p "$link")"
+	done < "$m/etc-symlinks.txt"
+	# Hostname: aus dem Clone oder neu (--hostname). Neuer Hostname = zweite Box → eigene Host-Keys
+	host="$(state_get NEW_HOSTNAME)"
+	if [ -n "$host" ] && [ "$host" != "$(cat "$m/hostname")" ]; then
+		lbb_logged "$(lbb_p "$lbhome")/sbin/changehostname.sh" "$host" || log_warn "Hostname nicht gesetzt."
+		_apply_new_host_keys
+	else
+		lbb_logged "$(lbb_p "$lbhome")/sbin/changehostname.sh" "$(cat "$m/hostname")" || log_warn "Hostname nicht gesetzt."
+	fi
+	lbname="$(state_get NEW_LBNAME)"
+	if [ -n "$lbname" ]; then
+		_apply_set_lbname "$lbhome" "$lbname"
+	fi
+	if [ "${META_HAS_LOXBERRYID:-0}" = 1 ]; then
+		_apply_new_loxberryid "$lbhome"
+	fi
+	tz="$(cat "$m/timezone" 2>/dev/null)"
+	if [ -n "$tz" ]; then
+		lbb_logged timedatectl set-timezone "$tz" || log_warn "Zeitzone $tz nicht gesetzt."
+	fi
+	lbb_logged "$(lbb_p "$lbhome")/sbin/mqtt-handler.pl" action=mosquitto_set || log_warn "Mosquitto-Konfiguration nicht neu erzeugt."
+	systemctl daemon-reload 2>&1 | lbb_output
+	lbb_logged sysctl --system || log_warn "sysctl --system meldete Fehler."
+	lbb_logged "$(lbb_p "$lbhome")/sbin/resetpermissions.sh" || log_warn "Dateirechte: resetpermissions.sh meldete Fehler (Details im Log)."
+	return 0
+}
+
+apply_step_R11() {
+	local -a extra=()
+	read -r -a extra <<< "$(state_get STOPPED_SERVICES)"
+	systemctl start cron mosquitto apache2 loxberry "${extra[@]}" 2>&1 | lbb_output
+	if [ "${PIPESTATUS[0]}" != 0 ]; then
+		log_warn "Nicht alle Dienste ließen sich starten (Details im Log ${LBB_LOGFILE:-})."
+	fi
+	return 0
+}
+
+# Datenbank-Dump in die inzwischen installierte und gestartete MariaDB einspielen
+apply_step_R11B() {
+	local dump
+	dump="$(_apply_state)/dumps/mariadb.sql"
+	[ -s "$dump" ] || return 0
+	if ! systemctl start mariadb; then
+		log_warn "MariaDB startet nicht – Dump nicht eingespielt, er liegt in $dump."
+		return 0
+	fi
+	if mariadb < "$dump"; then
+		rm -f "$dump"
+		log_ok "MariaDB-Datenbanken eingespielt."
+	else
+		log_warn "Einspielen des MariaDB-Dumps fehlgeschlagen; er liegt in $dump."
+	fi
+	return 0
+}
+
+# --update-core: Core-Update aufs neueste Release, nachdem der Clone vollständig eingespielt ist
+apply_step_R11C() {
+	[ "$(state_get UPDATE_CORE)" = 1 ] || return 0
+	log_info "Core-Update auf das neueste Release (--update-core)"
+	"$(lbb_p "$META_LB_HOMEDIR")/sbin/loxberryupdatecheck.pl" querytype=release update=1 nobackup=1 2>&1 | lbb_output_always
+	if [ "${PIPESTATUS[0]}" != 0 ]; then
+		log_warn "Core-Update meldete Fehler (Log: $LBB_LOGFILE)."
+	fi
+	return 0
+}
+
+apply_step_R12() {
+	apply_env_load
+	LBB_FORCE_PLUGIN_REINSTALL="$(state_get FORCE_PLUGIN_REINSTALL)"
+	LBB_NO_PLUGIN_REINSTALL="$(state_get NO_PLUGIN_REINSTALL)"
+	read -r -a LBB_SKIP_PLUGINS <<< "$(state_get SKIP_PLUGINS)"
+	LBB_REPORT="${LBB_REPORT:-$(_apply_state)/report.txt}"
+	: > "$LBB_REPORT"
+	local work
+	work="$(mktemp -d /tmp/lbclone-plugins.XXXXXX)"
+	# plugininstall.pl entpackt das Zip als loxberry (sudo -u loxberry unzip, plugininstall.pl:416)
+	chmod 755 "$work"
+	plugins_reinstall_all "$META_LB_HOMEDIR" "$work" || true
+	rm -rf "$work"
+	return 0
+}
+
+apply_step_R13() {
+	local dest
+	LBB_REPORT="${LBB_REPORT:-$(_apply_state)/report.txt}"
+	local warnfile n final no_reboot
+	warnfile="$(_apply_state)/warnings.txt"
+	no_reboot="$(state_get NO_REBOOT)"
+	{
+		printf 'Bericht Plugins:\n'
+		if [ -r "$LBB_REPORT" ]; then
+			sed 's/\t/   /g; s/^/  /' "$LBB_REPORT"
+		fi
+		if [ -s "$warnfile" ]; then
+			printf 'Warnungen aus allen Phasen:\n'
+			sed 's/^/  /' "$warnfile"
+		fi
+	} | tee -a "${LBB_LOGFILE:-/dev/null}"
+	if [ -r "$LBB_REPORT" ] && grep -q $'\tFEHLER\t' "$LBB_REPORT"; then
+		log_warn "Plugins mit Fehler: über die WebUI erneut installieren."
+	fi
+	# Exitcode 1, wenn es in irgendeiner Phase Warnungen gab (auch vor einem --resume)
+	if [ -s "$warnfile" ]; then
+		n="$(wc -l < "$warnfile")"
+		LBB_WARNINGS=$((LBB_WARNINGS + n))
+	fi
+	dest="$(lbb_p "$META_LB_HOMEDIR")/log/system/lbclone"
+	mkdir -p "$dest"
+	if [ -n "$LBB_LOGFILE" ] && [ -r "$LBB_LOGFILE" ]; then
+		final="$dest/apply-$(date +%Y%m%d-%H%M%S).log"
+		mv "$LBB_LOGFILE" "$final"
+		LBB_LOGFILE="$final"
+	fi
+	# Entschlüsselte Kopie des Clones im Zustandsverzeichnis wegräumen
+	case "$(state_get INPUT)" in
+		"$(_apply_state)"/*) rm -f "$(state_get INPUT)" ;;
+	esac
+	rm -f "$(_state_file)" "$warnfile"
+	rm -rf "$(_apply_state)/meta" "$(_apply_state)/installer"
+	log_ok "Restore abgeschlossen."
+	if [ "$no_reboot" = 1 ]; then
+		log_info "Kein Neustart (--no-reboot); die Box sollte bald neu gestartet werden."
+	else
+		log_info "Neustart."
+		systemctl reboot
+	fi
+	return 0
+}
+
+# ============================================================ eingebettete Dateien
+
+# Pakete, die nie übertragen werden (SPEC 5.3)
+_lbb_conf_packages_exclude() {
+	cat <<'LBB_EOF'
+# Pakete, die nie von einer Box auf eine andere übertragen werden – alle übrigen manuell
+# installierten Pakete gehen beim Restore komplett an apt (apt überspringt, was schon da ist).
+# Hier stehen nur hardwaregebundene Pakete: sie können über Paketkonflikte z. B. den
+# Bootloader einer anders aufgesetzten Box austauschen.
+# Muster: * passt beliebig viele Zeichen. Siehe SPEC 5.3.
+
+# Kernel und Bootloader
+linux-image-*  linux-headers-*  grub-*  os-prober
+# Firmware und Board-spezifisches
+raspberrypi-*  firmware-*  pivccu-devicetree-*
+# Virtualisierungs-Agenten
+qemu-guest-agent  open-vm-tools*  virtualbox-guest-*
+LBB_EOF
+}
+
+# /etc-Einträge, die apply nicht einspielt (SPEC 5.6)
+_lbb_conf_etc_restore_exclude() {
+	cat <<'LBB_EOF'
+# Dateien aus /etc, die der Restore NICHT auf die neue Box einspielt, obwohl sie im Backup
+# liegen. tar-Muster relativ zu /, * und ? als Platzhalter. Siehe SPEC 5.6.
+#
+# Zusätzlich ausgelassen: alle Symlinks aus meta/etc-symlinks.txt (Ziel unter LBHOMEDIR) –
+# die legen Installer bzw. R10 an.
+
+# Root-Partition per UUID: auf neuer SD-Karte/Platte bootet die Box sonst nicht mehr
+etc/fstab  etc/.fstab  etc/fstab.backup
+
+# Identität der Maschine
+etc/machine-id
+
+# Benutzer und Gruppen: die frische Box hat eigene uid/gid-Zuordnungen (Benutzer macht R8 gezielt)
+etc/passwd  etc/passwd-  etc/group  etc/group-  etc/shadow  etc/shadow-
+etc/gshadow  etc/gshadow-  etc/subuid  etc/subuid-  etc/subgid  etc/subgid-
+
+# Netzwerk der neuen Box (Interfacenamen, WLAN)
+etc/network  etc/systemd/network  etc/wpa_supplicant
+
+# Startlinks auf Init-Skripte noch nicht installierter Pakete; die Pakete legen sie selbst an
+etc/rc?.d
+
+# Laufzeitdateien
+etc/resolv.conf  etc/resolv.conf.*  etc/mtab
+LBB_EOF
+}
+
+# Vorlage für $LBHOMEDIR/config/system/lbclone.cfg (lbclone config-example)
+_lbb_conf_example() {
+	cat <<'LBB_EOF'
+# Dauerhafte Voreinstellungen für "lbclone create".
+# Ablage: $LBHOMEDIR/config/system/lbclone.cfg (wird automatisch gelesen).
+
+# Nutzdaten einzelner Plugins ausschließen (Pfad unter data/plugins/<folder>/)
+#exclude-plugin-data = motioneye:kamera1
+#exclude-plugin-data = stats4lox:backups
+
+# Dienste für die Dauer des Backups stoppen (mosquitto wird immer kurz gestoppt)
+#stop-service = influxdb
+
+# Logs ausschließen (1 = ja)
+#no-logs = 0
+
+# Archivformat: 7z (Standard), zip oder gz
+#compress = 7z
+LBB_EOF
+}
+
+# Perl-Teil der Plugin-Logik (decide | pick | version), per "perl -" aus diesem Heredoc
+_lbb_perl_code() {
+	cat <<'LBB_PERL'
+# Plugin-Logik für lbclone: Entscheidung, Kanalwahl, Versionsabfrage.
+# Liest die Plugin-Datenbank nur – geschrieben wird sie ausschließlich von plugininstall.pl.
+use strict;
+use warnings;
+use JSON::PP;
+use Getopt::Long qw(GetOptionsFromArray);
+# LoxBerry::System erst in pick_channel laden: decide --meta muss auch auf einem frischen
+# DietPi ohne LoxBerry-Libs laufen (restore --dry-run, info).
+
+my $cmd = shift @ARGV // '';
+exit cmd_decide(@ARGV)  if $cmd eq 'decide';
+exit cmd_pick(@ARGV)    if $cmd eq 'pick';
+exit cmd_version(@ARGV) if $cmd eq 'version';
+print STDERR "usage: $0 decide|pick|version ...\n";
+exit 2;
+
+sub read_json {
+	my $f = shift;
+	open my $fh, '<', $f or die "$f: $!\n";
+	local $/;
+	my $d = decode_json(<$fh>);
+	close $fh;
+	return $d;
+}
+
+# Plugins als Hash md5 → {folder, name, version, autoupdate, has_release, has_prerelease}
+sub load_plugins {
+	my ($db, $meta) = @_;
+	my %p;
+	if ($meta) {
+		for my $e (@{ read_json($meta)->{plugins} // [] }) {
+			$p{ $e->{md5} } = { %$e, has_release => $e->{has_release} ? 1 : 0, has_prerelease => $e->{has_prerelease} ? 1 : 0 };
+		}
+	} else {
+		my $d = read_json($db);
+		for my $md5 (keys %{ $d->{plugins} // {} }) {
+			my $e = $d->{plugins}{$md5};
+			$p{$md5} = {
+				folder => $e->{folder}, name => $e->{name}, version => $e->{version}, autoupdate => $e->{autoupdate},
+				has_release => (($e->{releasecfg} // '') ne '') ? 1 : 0,
+				has_prerelease => (($e->{prereleasecfg} // '') ne '') ? 1 : 0,
+			};
+		}
+	}
+	return \%p;
+}
+
+sub decide_one {
+	my ($au, $hasrel, $haspre, $force, $none, $skipped) = @_;
+	return ('skip', '-') if $skipped;
+	return ('keep', '-') if $none;
+	return ('keep', '-') if $au eq '0';
+	return ('nourl', '-') if !$hasrel && !$haspre;
+	if ($au eq '3') {
+		return $hasrel ? ('reinstall', 'release') : ('nourl', '-');
+	}
+	return ('reinstall', 'auto') if $au eq '4';
+	if ($au eq '1' || $au eq '2') {
+		return ('keep', '-') unless $force;
+		return $hasrel ? ('reinstall', 'release') : ('nourl', '-');
+	}
+	return ('keep', '-');
+}
+
+sub cmd_decide {
+	my @a = @_;
+	my ($db, $meta, $force, $none, @skip);
+	GetOptionsFromArray(\@a, 'db=s' => \$db, 'meta=s' => \$meta, 'force' => \$force, 'none' => \$none, 'skip=s' => \@skip) or return 2;
+	return 2 unless $db || $meta;
+	my %skip = map { $_ => 1 } @skip;
+	my $p = load_plugins($db, $meta);
+	for my $md5 (sort { ($p->{$a}{folder} // '') cmp ($p->{$b}{folder} // '') } keys %$p) {
+		my $e = $p->{$md5};
+		my $au = (defined $e->{autoupdate} && $e->{autoupdate} ne '') ? "$e->{autoupdate}" : '0';
+		my ($dec, $mode) = decide_one($au, $e->{has_release}, $e->{has_prerelease}, $force, $none, $skip{ $e->{folder} // '' });
+		print join("\t", $md5, $e->{folder} // '', $e->{name} // '', $e->{version} // '', $au, $dec, $mode), "\n";
+	}
+	return 0;
+}
+
+# release.cfg / prerelease.cfg: Abschnitt [AUTOUPDATE] mit VERSION und ARCHIVEURL
+sub read_cfg {
+	my $f = shift;
+	return undef unless $f && -s $f;
+	open my $fh, '<', $f or return undef;
+	my %h;
+	my $sec = '';
+	while (my $l = <$fh>) {
+		$l =~ s/\r?\n$//;
+		next if $l =~ /^\s*(?:[#;]|$)/;
+		if ($l =~ /^\s*\[(.+?)\]\s*$/) { $sec = uc $1; next; }
+		if ($sec eq 'AUTOUPDATE' && $l =~ /^\s*([^=]+?)\s*=\s*(.*?)\s*$/) {
+			my ($k, $v) = (uc $1, $2);
+			$v =~ s/^"(.*)"$/$1/;
+			$h{$k} = $v;
+		}
+	}
+	close $fh;
+	return ($h{VERSION} && $h{ARCHIVEURL}) ? \%h : undef;
+}
+
+# Regel wie pluginsupdate.pl ab Z. 291, aber gleiche Version ist erlaubt, ältere nicht.
+sub pick_channel {
+	my ($inst, $rel, $pre) = @_;
+	require LoxBerry::System;
+	my $cr = $rel ? LoxBerry::System::plugin_version_compare($rel->{VERSION}, $inst) : undef;
+	my $cp = $pre ? LoxBerry::System::plugin_version_compare($pre->{VERSION}, $inst) : undef;
+	my $rgt = defined $cr && $cr == 1;
+	my $pgt = defined $cp && $cp == 1;
+	if ($rgt || $pgt) {
+		if ($rgt && $pgt) {
+			return LoxBerry::System::plugin_version_has_prerelease($inst) ? 'prerelease' : 'release';
+		}
+		return $rgt ? 'release' : 'prerelease';
+	}
+	return 'release'    if defined $cr && $cr == 0;
+	return 'prerelease' if defined $cp && $cp == 0;
+	return undef;
+}
+
+sub cmd_pick {
+	my @a = @_;
+	my ($mode, $inst, $relf, $pref);
+	GetOptionsFromArray(\@a, 'mode=s' => \$mode, 'installed=s' => \$inst, 'release=s' => \$relf, 'prerelease=s' => \$pref) or return 2;
+	return 2 unless $mode && defined $inst;
+	my $rel = read_cfg($relf);
+	my $pre = $mode eq 'auto' ? read_cfg($pref) : undef;
+	my $type = pick_channel($inst, $rel, $pre) or return 3;
+	my $c = $type eq 'release' ? $rel : $pre;
+	print join("\t", $type, $c->{VERSION}, $c->{ARCHIVEURL}), "\n";
+	return 0;
+}
+
+sub cmd_version {
+	my @a = @_;
+	my ($db, $md5);
+	GetOptionsFromArray(\@a, 'db=s' => \$db, 'md5=s' => \$md5) or return 2;
+	my $v = read_json($db)->{plugins}{$md5}{version};
+	return 3 unless defined $v;
+	print "$v\n";
+	return 0;
+}
+LBB_PERL
+}
+
+# ============================================================ Kommandozeile
+
+usage() {
+	cat <<'EOF'
+lbclone create --output <verzeichnis> [--exclude-plugin-data <folder>:<pfad>] [--no-logs]
+                     [--stop-service <name>] [--compress 7z|zip|gz] [--encrypt --passphrase-file <datei>]
+                     [--config <datei>] [--dry-run]
+lbclone apply [--input <clone>] [--passphrase-file <datei>] [--force-plugin-reinstall]
+                     [--no-plugin-reinstall] [--skip-plugin <folder>] [--skip-install]
+                     [--allow-core-mismatch] [--github-auth <user:token>] [--no-reboot]
+                     [--hostname <name>] [--lbname <LoxBerry-Name>] [--update-core] [--dry-run]
+lbclone apply --resume
+lbclone info    [--input <clone>] [--passphrase-file <datei>]
+lbclone verify  [--input <clone>] [--passphrase-file <datei>]
+
+<clone> ist das ganze Archiv (.7z, .zip, .tar.gz) oder das entpackte loxberry.tar[.gpg].
+Ohne --input nimmt lbclone das loxberry.tar[.gpg], das neben ihm liegt.
+
+lbclone config-example   Vorlage für $LBHOMEDIR/config/system/lbclone.cfg ausgeben
+
+Alle Kommandos: -v|--verbose  sehr gesprächige Ausgabe (Schritte, Befehle, Dateilisten)
+EOF
+}
+
+lbb_main() {
+	cmd="${1:-}"
+	shift || true
+
+	# Interne bzw. einfache Kommandos ohne Optionsauswertung
+	case "$cmd" in
+		-h|--help|help) usage; exit 0 ;;
+		'') usage; exit 2 ;;
+		__plugins) _lbb_perl "$@"; exit $? ;;
+		config-example) _lbb_conf_example; exit 0 ;;
+	esac
+
+	# Konfigurationsdatei zuerst lesen, damit die Kommandozeile sie überschreibt
+	if [ "$cmd" = create ]; then
+		_cfg=""
+		_prev=""
+		for _a in "$@"; do
+			[ "$_prev" = --config ] && _cfg="$_a"
+			_prev="$_a"
+		done
+		if [ -z "$_cfg" ]; then
+			_lb="$(lbb_lbhomedir)"
+			if [ -n "$_lb" ] && [ -r "$(lbb_p "$_lb")/config/system/lbclone.cfg" ]; then
+				_cfg="$(lbb_p "$_lb")/config/system/lbclone.cfg"
+			fi
+		fi
+		[ -n "$_cfg" ] && lbb_load_config "$_cfg"
+	fi
+
+	LBB_PASSFILE="-"
+	LBB_ENCRYPT=0
+	LBB_SKIP_PLUGINS=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--output) LBB_OUTPUT="$2"; shift ;;
+			--input) LBB_INPUT="$2"; shift ;;
+			--passphrase-file) LBB_PASSFILE="$2"; shift ;;
+			--encrypt) LBB_ENCRYPT=1 ;;
+			--exclude-plugin-data) LBB_PLUGIN_EXCLUDES+=("$2"); shift ;;
+			--no-logs) LBB_NO_LOGS=1 ;;
+			--stop-service) LBB_STOP_SERVICES+=("$2"); shift ;;
+			--compress) LBB_COMPRESS="$2"; shift ;;
+			--config) LBB_CONFIG="$2"; shift ;;
+			--dry-run) LBB_DRY_RUN=1 ;;
+			--force-plugin-reinstall) LBB_FORCE_PLUGIN_REINSTALL=1 ;;
+			--no-plugin-reinstall) LBB_NO_PLUGIN_REINSTALL=1 ;;
+			--skip-plugin) LBB_SKIP_PLUGINS+=("$2"); shift ;;
+			--skip-install) LBB_SKIP_INSTALL=1 ;;
+			--allow-core-mismatch) LBB_ALLOW_CORE_MISMATCH=1 ;;
+			--github-auth) LBB_GITHUB_AUTH="$2"; shift ;;
+			--hostname) LBB_NEW_HOSTNAME="$2"; shift ;;
+			--lbname) LBB_NEW_LBNAME="$2"; shift ;;
+			--update-core) LBB_UPDATE_CORE=1 ;;
+			--no-reboot) LBB_NO_REBOOT=1 ;;
+			--resume) LBB_RESUME=1 ;;
+			-v|--verbose) LBB_VERBOSE=1 ;;
+			-h|--help) usage; exit 0 ;;
+			*) usage >&2; die 2 "Unbekannte Option: $1" ;;
+		esac
+		shift
+	done
+
+	if [ "$cmd" = create ]; then
+		if [ "$LBB_ENCRYPT" = 1 ] && [ "$LBB_PASSFILE" = "-" ]; then
+			die 2 "--encrypt braucht --passphrase-file."
+		fi
+		[ "$LBB_ENCRYPT" = 1 ] || LBB_PASSFILE="-"
+	fi
+
+	# Ohne --input: das loxberry.tar neben dem entpackten lbclone-Ordner
+	if [ -z "${LBB_INPUT:-}" ] && [ "${LBB_RESUME:-0}" != 1 ]; then
+		case "$cmd" in
+			apply|info|verify)
+				for _f in "$(dirname "$LBB_SELF")/loxberry.tar" "$(dirname "$LBB_SELF")/loxberry.tar.gpg"; do
+					if [ -r "$_f" ]; then
+						LBB_INPUT="$(readlink -m "$_f")"
+						break
+					fi
+				done
+				;;
+		esac
+	fi
+
+	case "$cmd" in
+		create) create_main ;;
+		apply) apply_main ;;
+		info) info_main ;;
+		verify) verify_main ;;
+		*) usage >&2; die 2 "Unbekanntes Kommando: ${cmd:-<leer>}" ;;
+	esac
+	lbb_final_exit
+}
+
+# Nur ausführen, wenn die Datei aufgerufen und nicht per "source" geladen wird
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	lbb_main "$@"
+fi
