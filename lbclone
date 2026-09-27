@@ -6,7 +6,7 @@
 #
 # Wird die Datei mit "source" geladen (Tests), definiert sie nur die Funktionen.
 
-LBB_VERSION="0.1.0"
+LBB_VERSION="0.1.1"
 LBB_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # ============================================================ common
@@ -307,6 +307,17 @@ collect_native() {
 			read($h, $magic, 4);
 			print "$f\n" if $magic eq "\x7fELF";
 		} }, @ARGV);' ) | sort
+}
+
+# Zeitzone: /etc/timezone gibt es ab Debian 13 nicht mehr, dann aus dem Link /etc/localtime
+collect_timezone() {
+	local tz
+	tz="$(cat "$(lbb_p /etc/timezone)" 2>/dev/null)"
+	if [ -z "$tz" ]; then
+		tz="$(readlink "$(lbb_p /etc/localtime)" 2>/dev/null | sed -n 's|.*zoneinfo/||p')"
+	fi
+	[ -n "$tz" ] && printf '%s\n' "$tz"
+	return 0
 }
 
 collect_optional_dirs() {
@@ -926,7 +937,7 @@ create_build_meta() {
 	( umask 077; collect_passwd_hashes > "$m/passwd-hashes.txt" )
 	collect_etc_symlinks "$lbhome" > "$m/etc-symlinks.txt"
 	printf '%s\n' "$META_HOSTNAME" > "$m/hostname"
-	cat "$(lbb_p /etc/timezone)" > "$m/timezone" 2>/dev/null
+	collect_timezone > "$m/timezone"
 }
 
 create_build_lists() {
@@ -1279,6 +1290,57 @@ _apply_step_title() {
 	esac
 }
 
+# DNS-Ausweichlösung: Ist die Namensauflösung gestört, nutzt der Restore vorübergehend 1.1.1.1 und
+# 8.8.8.8 (/etc/resolv.conf). Das Original liegt im Zustandsverzeichnis und kommt bei einem Fehler,
+# beim Beenden und vor dem Neustart zurück – außer das System hat die Datei inzwischen selbst neu
+# geschrieben (DHCP, resolvconf).
+_LBB_DNS_MARK="# lbclone: vorübergehende Namensauflösung, wird am Ende zurückgestellt"
+
+_apply_dns_ok() {
+	getent ahosts deb.debian.org > /dev/null 2>&1
+}
+
+_apply_ensure_dns() {
+	local rc bak
+	rc="$(lbb_p /etc/resolv.conf)"
+	bak="$(_apply_state)/resolv.conf.orig"
+	_apply_dns_ok && return 0
+	# Ausweichlösung schon aktiv und trotzdem gestört: nicht erneut sichern
+	if [ -f "$rc" ] && [ ! -L "$rc" ] && grep -qxF "$_LBB_DNS_MARK" "$rc"; then
+		return 0
+	fi
+	rm -f "$bak" "$bak.none"
+	if [ -e "$rc" ] || [ -L "$rc" ]; then
+		mv -f "$rc" "$bak" || return 0
+	else
+		: > "$bak.none"
+	fi
+	printf '%s\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' "$_LBB_DNS_MARK" > "$rc"
+	if _apply_dns_ok; then
+		log_warn "Die Namensauflösung über den DNS-Server des Systems ist gestört – lbclone nutzt vorübergehend 1.1.1.1 und 8.8.8.8 (/etc/resolv.conf wird am Ende zurückgestellt)."
+		return 0
+	fi
+	_apply_restore_dns
+	log_warn "Die Namensauflösung ist gestört, auch über 1.1.1.1 und 8.8.8.8 nicht möglich (Firewall?). Downloads können fehlschlagen."
+	return 0
+}
+
+_apply_restore_dns() {
+	local rc bak
+	rc="$(lbb_p /etc/resolv.conf)"
+	bak="$(_apply_state)/resolv.conf.orig"
+	{ [ -e "$bak" ] || [ -L "$bak" ] || [ -e "$bak.none" ]; } || return 0
+	# Nur die eigene Fassung ersetzen; eine inzwischen vom System geschriebene bleibt
+	if [ -f "$rc" ] && [ ! -L "$rc" ] && grep -qxF "$_LBB_DNS_MARK" "$rc"; then
+		rm -f "$rc"
+		if [ -e "$bak" ] || [ -L "$bak" ]; then
+			mv -f "$bak" "$rc"
+		fi
+	fi
+	rm -f "$bak" "$bak.none"
+	return 0
+}
+
 # Arbeitsverzeichnis der Schritte: das Home von loxberry. Programme, die per "sudo -u loxberry"
 # laufen (z. B. find in plugininstall.pl:1806), scheitern in einem Verzeichnis, das loxberry nicht
 # betreten darf (/root). Vor und während der Installation gibt es das Home noch nicht bzw. der
@@ -1307,7 +1369,9 @@ apply_run_steps() {
 		fi
 		log_info "Schritt $n von $total: $(_apply_step_title "$s")"
 		cd "$(_apply_workdir)" || cd / || return 3
+		_apply_ensure_dns
 		if ! "apply_step_$s"; then
+			_apply_restore_dns
 			log_err "Fehlgeschlagen: $(_apply_step_title "$s"). Details im Log ${LBB_LOGFILE:-}; nach der Behebung fortsetzen mit: bash lbclone apply --resume"
 			return 3
 		fi
@@ -1432,6 +1496,7 @@ apply_main() {
 			return 0
 		fi
 		trap '' HUP
+		trap '_apply_restore_dns' EXIT
 		echo "$$" > "$(_apply_state)/apply.pid"
 		_apply_load_options
 		apply_run_steps
@@ -1733,6 +1798,18 @@ _apply_new_host_keys() {
 	log_ok "Neue Host-Keys erzeugt (neuer Hostname)."
 }
 
+# changehostname.sh löscht die Zeile des Hostnamens aus /etc/hosts und legt keine neue an; bis zum
+# nächsten Neustart ließe sich der eigene Name nicht auflösen (sudo meldet das bei jedem Aufruf,
+# jeder Aufruf fragt den DNS-Server). sethosts.sh des Cores trägt die aktuelle Adresse ein.
+_apply_hosts_entry() {
+	local sh iface
+	sh="$(lbb_p "$1")/sbin/sethosts.sh"
+	[ -x "$sh" ] || return 0
+	iface="$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+	[ -n "$iface" ] || return 0
+	IFACE="$iface" lbb_logged "$sh" || log_warn "Eintrag des Hostnamens in /etc/hosts nicht gesetzt."
+}
+
 # LoxBerry-Name (general.json → Network.Friendlyname); Eigentümer und Rechte der Datei bleiben
 _apply_set_lbname() {
 	local gj tmp
@@ -1778,6 +1855,7 @@ apply_step_R10() {
 	else
 		lbb_logged "$(lbb_p "$lbhome")/sbin/changehostname.sh" "$(cat "$m/hostname")" || log_warn "Hostname nicht gesetzt."
 	fi
+	_apply_hosts_entry "$lbhome"
 	lbname="$(state_get NEW_LBNAME)"
 	if [ -n "$lbname" ]; then
 		_apply_set_lbname "$lbhome" "$lbname"
@@ -1865,6 +1943,7 @@ apply_step_R13() {
 	local dest
 	LBB_REPORT="${LBB_REPORT:-$(_apply_state)/report.txt}"
 	local warnfile n final no_reboot
+	_apply_restore_dns
 	warnfile="$(_apply_state)/warnings.txt"
 	no_reboot="$(state_get NO_REBOOT)"
 	{
