@@ -816,7 +816,7 @@ plugins_reinstall_all() {
 # Diese Quellen legt install_trixie_v4.sh selbst an (Z. 359, 370, 376)
 LBB_INSTALLER_SOURCES="sury-php.sources yarn.list cloudflared.list"
 
-_BACKUP_STOPPED=()
+_CREATE_STOPPED=()
 # Arbeitsordner global, damit die EXIT-Falle ihn nach dem Ende der Funktion noch kennt
 _LBB_WORK=""
 # Zwischenablage für Datenbank-Dumps auf dem Zielmedium (nicht im tmpfs /tmp)
@@ -852,18 +852,18 @@ _create_dump_mariadb() {
 	mkdir -p "$stage/dumps"
 	log_info "Sichere MariaDB per mariadb-dump (ohne Stopp)"
 	if ! ( umask 077; mariadb-dump --single-transaction --all-databases --routines --events > "$stage/dumps/mariadb.sql" ); then
-		log_warn "mariadb-dump fehlgeschlagen – die Datenbank fehlt im Backup."
+		log_warn "mariadb-dump fehlgeschlagen – die Datenbank fehlt im Clone."
 		rm -f "$stage/dumps/mariadb.sql"
 	fi
 }
 
 _create_restart_services() {
 	local s
-	for s in "${_BACKUP_STOPPED[@]}"; do
+	for s in "${_CREATE_STOPPED[@]}"; do
 		[ -n "$s" ] || continue
 		systemctl start "$s" || log_warn "Dienst $s ließ sich nicht starten."
 	done
-	_BACKUP_STOPPED=()
+	_CREATE_STOPPED=()
 }
 
 _create_stop_service() {
@@ -873,7 +873,7 @@ _create_stop_service() {
 		return 0
 	fi
 	if systemctl stop "$1"; then
-		_BACKUP_STOPPED+=("$1")
+		_CREATE_STOPPED+=("$1")
 	else
 		log_warn "Dienst $1 ließ sich nicht stoppen."
 	fi
@@ -963,7 +963,7 @@ create_build_lists() {
 			path="${e#*:}"
 			printf '%s\n' "$rel/data/plugins/$folder/$path"
 		done
-		# Liegt das Ausgabeverzeichnis in der Payload, würde das Backup sich und seine Vorgänger mitsichern
+		# Liegt das Ausgabeverzeichnis in der Payload, würde der Clone sich und seine Vorgänger mitsichern
 		out_abs="$(readlink -m "$LBB_OUTPUT")"
 		root_abs="$(readlink -m "$(lbb_p /)")"
 		case "$out_abs" in
@@ -1006,10 +1006,12 @@ create_main() {
 	trap '_create_restart_services; rm -rf "$_LBB_WORK" ${_LBB_STAGE:+"$_LBB_STAGE"}; [ -z "$_LBB_OUT" ] || rm -f "$_LBB_OUT"' EXIT
 	trap 'exit 3' INT TERM
 
+	log_info "Erfasse System, Pakete und Benutzer von $META_HOSTNAME (LoxBerry $META_LB_VERSION)"
 	create_build_meta "$work" "$lbhome"
 	if [ ! -r "$(lbb_p "$lbhome")/packages${META_OS_VERSION_ID%%.*}.txt" ]; then
 		log_warn "packages${META_OS_VERSION_ID%%.*}.txt fehlt – ohne Installer-Liste werden keine Paketdatenverzeichnisse unter /var/lib gesichert."
 	fi
+	log_info "Ermittle die zu sichernden Dateien und ihre Größe"
 	create_build_lists "$work" "$lbhome"
 	META_PAYLOAD_BYTES="$(cd "$(lbb_p /)" && tr '\n' '\0' < "$work/payload.list" \
 		| du -sbc --files0-from=- --exclude-from="$work/exclude.list" 2>/dev/null | tail -n 1 | cut -f1)"
@@ -1031,6 +1033,7 @@ create_main() {
 
 	# Mosquitto nicht stoppen: per SIGUSR1 schreiben lassen, dann die fertige Datei kopieren (SPEC 7.3)
 	if [ -d "$(lbb_p /var/lib/mosquitto)" ]; then
+		log_info "Sichere die Mosquitto-Datenbank (ohne Stopp)"
 		_create_flush_mosquitto
 		mkdir -p "$work/snap/var/lib"
 		cp -a "$(lbb_p /var/lib/mosquitto)" "$work/snap/var/lib/"
@@ -1045,7 +1048,11 @@ create_main() {
 
 	ext="$(archive_ext "$LBB_COMPRESS")"
 	out="$LBB_OUTPUT/lbclone-${META_HOSTNAME}-${META_LB_VERSION}-$(date +%Y%m%d-%H%M%S).$ext"
-	log_info "Schreibe $out"
+	if [ -n "$LBB_PASSWORD" ] && [ "$LBB_PASSWORD" != "-" ]; then
+		log_info "Schreibe das Archiv (verschlüsselt, AES256) – das dauert je nach Größe mehrere Minuten: $out"
+	else
+		log_info "Schreibe das Archiv – das dauert je nach Größe mehrere Minuten: $out"
+	fi
 	_LBB_OUT="$out"
 	archive_create "$out" "$work" "$LBB_COMPRESS" "$LBB_PASSWORD" "$work/exclude.list" "$work/payload.list" "$_LBB_STAGE"
 	rc=$?
@@ -1054,7 +1061,7 @@ create_main() {
 	_LBB_STAGE=""
 	case "$rc" in
 		0) ;;
-		1) log_warn "Dateien haben sich während des Backups geändert." ;;
+		1) log_warn "Dateien haben sich während des Erstellens geändert." ;;
 		*) rm -f "$out"; die 3 "Archiv konnte nicht geschrieben werden." ;;
 	esac
 	if [ -s "$work/tar-warnings.txt" ]; then
@@ -1062,14 +1069,15 @@ create_main() {
 		head -n 20 "$work/tar-warnings.txt" | while IFS= read -r s; do log_warn "  $s"; done
 	fi
 	chmod 600 "$out"
+	log_info "Prüfe das fertige Archiv (vollständiges Lesen, Prüfsummen)"
 	archive_verify "$out" "$LBB_PASSWORD" "$work/verify" || die 3 "Prüfung des Archivs fehlgeschlagen: $out"
 	_LBB_OUT=""
-	log_ok "Backup fertig: $out ($(du -h "$out" | cut -f1))"
+	log_ok "Clone fertig: $out ($(du -h "$out" | cut -f1))"
 	log_info "Einspielen auf einem frischen DietPi: Archiv entpacken (7z x …, auch unter Windows möglich), im entpackten Ordner als root: bash lbclone apply"
 	case "$LBB_OUTPUT" in
 		/mnt/*|/media/*)
 			if [ -z "$LBB_PASSWORD" ] || [ "$LBB_PASSWORD" = "-" ]; then
-				log_warn "Backup liegt auf einem Netz- oder Wechsellaufwerk und ist unverschlüsselt; es enthält Zugangsdaten. Empfehlung: --password."
+				log_warn "Der Clone liegt auf einem Netz- oder Wechsellaufwerk und ist unverschlüsselt; es enthält Zugangsdaten. Empfehlung: --password."
 			fi
 			;;
 	esac
@@ -1084,7 +1092,7 @@ _readonly_prepare() {
 }
 
 info_main() {
-	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
+	[ -r "$LBB_INPUT" ] || die 2 "Clone nicht lesbar: $LBB_INPUT"
 	_readonly_prepare info
 	archive_read_meta "$LBB_INPUT" "$LBB_PASSWORD" "$_LBB_WORK" || die 3 "Manifest nicht lesbar (Passwort falsch?)."
 	meta_read_json "$_LBB_WORK/meta/meta.json"
@@ -1098,7 +1106,7 @@ info_main() {
 }
 
 verify_main() {
-	[ -r "$LBB_INPUT" ] || die 2 "Backup nicht lesbar: $LBB_INPUT"
+	[ -r "$LBB_INPUT" ] || die 2 "Clone nicht lesbar: $LBB_INPUT"
 	_readonly_prepare verify
 	archive_verify "$LBB_INPUT" "$LBB_PASSWORD" "$_LBB_WORK" || die 3 "Archiv beschädigt oder Prüfsummen falsch: $LBB_INPUT"
 	log_ok "Archiv in Ordnung: $LBB_INPUT"
@@ -1143,14 +1151,14 @@ apply_precheck() {
 	meta_read_json "$st/meta/meta.json"
 	log_debug "Manifest: $META_HOSTNAME, $META_OS_ID $META_OS_VERSION_ID ($META_OS_CODENAME), $META_ARCH, LoxBerry $META_LB_VERSION"
 
-	meta_check_v0 || die 2 "Backup von Debian $META_OS_VERSION_ID / LoxBerry $META_LB_VERSION wird nicht unterstützt."
+	meta_check_v0 || die 2 "Clone von Debian $META_OS_VERSION_ID / LoxBerry $META_LB_VERSION wird nicht unterstützt."
 	if [ "$(_apply_os_release ID)" != "$META_OS_ID" ] ||
 		[ "$(_apply_os_release VERSION_ID)" != "$META_OS_VERSION_ID" ] ||
 		[ "$(_apply_os_release VERSION_CODENAME)" != "$META_OS_CODENAME" ]; then
-		die 2 "Betriebssystem passt nicht (Backup: $META_OS_ID $META_OS_VERSION_ID $META_OS_CODENAME)."
+		die 2 "Betriebssystem passt nicht (Clone: $META_OS_ID $META_OS_VERSION_ID $META_OS_CODENAME)."
 	fi
 	if [ -n "${META_DEBIAN_VERSION:-}" ] && [ "$(cat "$(lbb_p /etc/debian_version)" 2>/dev/null)" != "$META_DEBIAN_VERSION" ]; then
-		log_warn "Debian-Subversion weicht ab (Backup $META_DEBIAN_VERSION, hier $(cat "$(lbb_p /etc/debian_version)" 2>/dev/null))."
+		log_warn "Debian-Subversion weicht ab (Clone $META_DEBIAN_VERSION, hier $(cat "$(lbb_p /etc/debian_version)" 2>/dev/null))."
 	fi
 	LBB_ARCH_CHANGE=0
 	if [ "$(dpkg --print-architecture)" != "$META_ARCH" ]; then
@@ -1173,15 +1181,15 @@ apply_precheck() {
 		fi
 	else
 		[ -n "$lbhome" ] || die 2 "--skip-install, aber kein LoxBerry installiert."
-		[ "$lbhome" = "$META_LB_HOMEDIR" ] || die 2 "LBHOMEDIR $lbhome weicht vom Backup ab ($META_LB_HOMEDIR)."
+		[ "$lbhome" = "$META_LB_HOMEDIR" ] || die 2 "LBHOMEDIR $lbhome weicht vom Clone ab ($META_LB_HOMEDIR)."
 		have_ver="$(jq -r '.Base.Version // empty' "$(lbb_p "$lbhome")/config/system/general.json" 2>/dev/null)"
 		if [ "$have_ver" != "$META_LB_VERSION" ] && [ "${LBB_ALLOW_CORE_MISMATCH:-0}" != 1 ]; then
-			die 2 "Installiert ist LoxBerry $have_ver, das Backup stammt von $META_LB_VERSION."
+			die 2 "Installiert ist LoxBerry $have_ver, der Clone stammt von $META_LB_VERSION."
 		fi
 	fi
 
 	avail="$(df --output=avail -B1 "$(lbb_p /)" | tail -n 1 | tr -d ' ')"
-	[ "$avail" -gt "$(( ${META_PAYLOAD_BYTES:-0} * 2 ))" ] || die 2 "Zu wenig Platz ($avail Bytes frei, Backup ca. $META_PAYLOAD_BYTES)."
+	[ "$avail" -gt "$(( ${META_PAYLOAD_BYTES:-0} * 2 ))" ] || die 2 "Zu wenig Platz ($avail Bytes frei, Clone ca. $META_PAYLOAD_BYTES)."
 
 
 	# Clone einmal unverschlüsselt ins Zustandsverzeichnis (Platte): danach braucht der Restore
@@ -1581,7 +1589,7 @@ apply_step_R7() {
 	done < "$m/holds.txt"
 	if [ -r "$m/local-packages.txt" ]; then
 		awk -F'\t' '$4 == "fehlt" {print $1 " " $2}' "$m/local-packages.txt" | while IFS= read -r pkg; do
-			log_warn "Lokales Paket ohne .deb im Backup: $pkg"
+			log_warn "Lokales Paket ohne .deb im Clone: $pkg"
 		done
 	fi
 	return 0
@@ -1690,7 +1698,7 @@ _apply_extract_userdata_only() {
 			/*) ;;
 			*) continue ;;
 		esac
-		# Nur Einträge, die im Backup vorkommen – sonst bricht tar mit "Not found in archive" ab
+		# Nur Einträge, die im Clone vorkommen – sonst bricht tar mit "Not found in archive" ab
 		re="$(printf '%s' "$lbrel$line" | sed -e 's/[].[\^$+(){}|]/\\&/g' -e 's/\*/.*/g' -e 's/?/./g')"
 		if grep -qE "^${re}(/|$)" "$listing"; then
 			members+=("$lbrel$line")
@@ -1698,10 +1706,10 @@ _apply_extract_userdata_only() {
 	done < "$excl"
 	rm -f "$listing"
 	if [ "${#members[@]}" -eq 0 ]; then
-		log_err "Keine Nutzdaten-Pfade im Backup gefunden – breche ab, statt den alten Core zurückzuspielen."
+		log_err "Keine Nutzdaten-Pfade im Clone gefunden – breche ab, statt den alten Core zurückzuspielen."
 		return 1
 	fi
-	log_warn "--allow-core-mismatch: nur Konfiguration und Daten aus dem Backup (ungeprüfter Weg)."
+	log_warn "--allow-core-mismatch: nur Konfiguration und Daten aus dem Clone (ungeprüfter Weg)."
 	archive_extract "$input" - "$(lbb_p /)" "$@" --wildcards "${members[@]}"
 }
 
@@ -1923,7 +1931,7 @@ LBB_EOF
 # /etc-Einträge, die apply nicht einspielt (SPEC 5.6)
 _lbb_conf_etc_restore_exclude() {
 	cat <<'LBB_EOF'
-# Dateien aus /etc, die der Restore NICHT auf die neue Box einspielt, obwohl sie im Backup
+# Dateien aus /etc, die der Restore NICHT auf die neue Box einspielt, obwohl sie im Clone
 # liegen. tar-Muster relativ zu /, * und ? als Platzhalter. Siehe SPEC 5.6.
 #
 # Zusätzlich ausgelassen: alle Symlinks aus meta/etc-symlinks.txt (Ziel unter LBHOMEDIR) –
@@ -1963,7 +1971,7 @@ _lbb_conf_example() {
 #exclude-plugin-data = motioneye:kamera1
 #exclude-plugin-data = stats4lox:backups
 
-# Dienste für die Dauer des Backups stoppen (mosquitto wird immer kurz gestoppt)
+# Dienste anhalten, solange der Clone erstellt wird (Mosquitto und MariaDB brauchen das nicht)
 #stop-service = influxdb
 
 # Logs ausschließen (1 = ja)
